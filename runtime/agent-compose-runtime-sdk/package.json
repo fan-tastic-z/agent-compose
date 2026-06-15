@@ -1,7 +1,7 @@
 {
   "name": "@chaitin-ai/agent-compose-runtime-sdk",
   "version": "0.4.0",
-  "license": "AGPL-3.0",
+  "license": "LGPL-3.0-only",
   "type": "module",
   "main": "./dist/cjs/index.cjs",
   "module": "./dist/esm/index.js",
