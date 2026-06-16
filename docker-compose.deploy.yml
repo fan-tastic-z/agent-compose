@@ -6,8 +6,6 @@ services:
     restart: always
     privileged: true
     command: ["/app/agent-compose", "daemon"]
-    devices:
-      - /dev/kvm:/dev/kvm
     environment:
       DATA_ROOT: /data
       SESSION_ROOT: /data/sessions
@@ -17,7 +15,7 @@ services:
       AUTH_PASSWORD: ${AUTH_PASSWORD:-}
       AUTH_SECRET: ${AUTH_SECRET:-}
       AUTH_SESSION_TTL: ${AUTH_SESSION_TTL:-24h}
-      RUNTIME_DRIVER: docker
+      RUNTIME_DRIVER: ${RUNTIME_DRIVER:-docker}
       DEFAULT_IMAGE: ${DEFAULT_IMAGE:-ghcr.io/chaitin/agent-compose-guest:latest}
       GUEST_WORKSPACE: /workspace
       GUEST_STATE_ROOT: /data/state
