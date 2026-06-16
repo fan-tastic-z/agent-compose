@@ -12,6 +12,8 @@ automatically), so the installer itself is tiny.
 | `agent-compose-installer.run` | Single-file self-extracting installer (arch-agnostic) |
 | `agent-compose-installer.tar.gz` | Same installer as a tar archive |
 | `install.sh` | Standalone installer for `curl \| bash` |
+| `agent-compose-<version>-<os>-<arch>.tar.gz` | Go binary archive |
+| `agent-compose-<version>-<os>-<arch>.tar.gz.sha256` | Per-binary checksum |
 | `SHASUMS256.txt` | Checksums |
 
 ## Quick start
@@ -57,6 +59,7 @@ On first run the installer generates an admin password and prints it once:
 ./install.sh --dir /opt/agent-compose --port 8080
 ./install.sh --version v1.2.3         # specific release (remote mode)
 ./install.sh --image-prefix registry.example.com/agent-compose   # mirror / private registry
+./install.sh --upgrade                # update an existing install to this release
 ./install.sh --no-auth                # run unauthenticated (trusted networks only)
 ./install.sh --no-start               # write files but don't pull images or start
 ```
@@ -81,3 +84,9 @@ docker compose down
 Configuration lives in `<install-dir>/.env`; edit and re-run
 `docker compose up -d` to apply changes. See `SECURITY.md` in the repository
 before exposing the daemon beyond a trusted network.
+
+Re-running the installer refreshes the compose/nginx files and fills missing
+secrets or image refs, but it does not overwrite image refs already set in
+`.env` unless `--upgrade` is passed. Use `--upgrade` with a newer
+`agent-compose-installer.run` to update an existing installation to that
+release and restart the stack.

@@ -22,6 +22,7 @@ IMAGE_PREFIX=""
 PORT=""
 NO_START=0
 NO_AUTH=0
+UPGRADE=0
 
 log()  { printf '\033[0;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -40,6 +41,7 @@ Options:
   --version <vX.Y.Z>     Release version to install in remote mode (default: latest)
   --image-prefix <ref>   Pull images from this prefix (mirror / private registry)
                          instead of the default registry
+  --upgrade              Update existing image refs to this installer version
   --no-auth              Do not generate a password; run unauthenticated
   --no-start             Lay down files but do not pull images or start
   -h, --help             Show this help
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
     --port)         PORT="${2:?--port needs a value}"; shift 2 ;;
     --version)      VERSION="${2:?--version needs a value}"; shift 2 ;;
     --image-prefix) IMAGE_PREFIX="${2:?--image-prefix needs a value}"; shift 2 ;;
+    --upgrade)      UPGRADE=1; shift ;;
     --no-auth)      NO_AUTH=1; shift ;;
     --no-start)     NO_START=1; shift ;;
     -h|--help)      usage; exit 0 ;;
@@ -104,6 +107,40 @@ get_env() { # $1=file $2=key -> value (may be empty)
   grep "^$2=" "$1" 2>/dev/null | head -n1 | cut -d= -f2- || true
 }
 
+apply_image_refs() { # $1=file $2=mode(set-missing|overwrite)
+  local file="$1" mode="$2" key value pair current
+  if [ -n "$IMAGE_PREFIX" ]; then
+    for pair in \
+      "AGENT_COMPOSE_IMAGE=${IMAGE_PREFIX}/agent-compose:${IMAGE_VERSION}" \
+      "AGENT_COMPOSE_FRONTEND_IMAGE=${IMAGE_PREFIX}/agent-compose-frontend:${IMAGE_VERSION}" \
+      "DEFAULT_IMAGE=${IMAGE_PREFIX}/agent-compose-guest:${IMAGE_VERSION}"; do
+      key="${pair%%=*}"
+      value="${pair#*=}"
+      current="$(get_env "$file" "$key")"
+      if [ "$mode" = "overwrite" ] || [ -z "$current" ]; then
+        set_env "$file" "$key" "$value"
+        log "Set $key in $file"
+      elif [ "$current" != "$value" ]; then
+        warn "$key already set; keeping existing image ref"
+      fi
+    done
+  elif [ -f "$MANIFEST" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        AGENT_COMPOSE_IMAGE|AGENT_COMPOSE_FRONTEND_IMAGE|DEFAULT_IMAGE)
+          current="$(get_env "$file" "$key")"
+          if [ "$mode" = "overwrite" ] || [ -z "$current" ]; then
+            set_env "$file" "$key" "$value"
+            log "Set $key in $file"
+          elif [ "$current" != "$value" ]; then
+            warn "$key already set; keeping existing image ref"
+          fi
+          ;;
+      esac
+    done < "$MANIFEST"
+  fi
+}
+
 # --------------------------------------------------------------------------
 # Locate bundle source (bundled vs remote)
 # --------------------------------------------------------------------------
@@ -132,12 +169,15 @@ else
   TMP_DIR="$(mktemp -d)"
   log "Downloading ${asset} (${VERSION})"
   curl -fsSL -o "$TMP_DIR/$asset" "$url" || die "download failed: $url"
-  if curl -fsSL -o "$TMP_DIR/$asset.sha256" "${url}.sha256" 2>/dev/null; then
-    if ( cd "$TMP_DIR" && sha256sum -c "$asset.sha256" >/dev/null 2>&1 ); then
+  shasums_url="${url%/*}/SHASUMS256.txt"
+  if curl -fsSL -o "$TMP_DIR/SHASUMS256.txt" "$shasums_url" 2>/dev/null; then
+    if ( cd "$TMP_DIR" && awk -v a="$asset" '$2 == a || $2 == "./" a' SHASUMS256.txt | sha256sum -c - >/dev/null 2>&1 ); then
       log "Checksum OK"
     else
-      warn "checksum verification skipped/failed"
+      die "checksum verification failed for $asset"
     fi
+  else
+    warn "checksum file unavailable; skipping verification"
   fi
   tar -xzf "$TMP_DIR/$asset" -C "$TMP_DIR"
   BUNDLE_SRC="$(find "$TMP_DIR" -maxdepth 2 -name docker-compose.yml -exec dirname {} \; | head -n1)"
@@ -194,21 +234,27 @@ if [ ! -f "$ENV_FILE" ]; then
     set_env "$ENV_FILE" AUTH_PASSWORD "$GENERATED_PASSWORD"
   fi
 
-  if [ -n "$IMAGE_PREFIX" ]; then
-    set_env "$ENV_FILE" AGENT_COMPOSE_IMAGE "${IMAGE_PREFIX}/agent-compose:${IMAGE_VERSION}"
-    set_env "$ENV_FILE" AGENT_COMPOSE_FRONTEND_IMAGE "${IMAGE_PREFIX}/agent-compose-frontend:${IMAGE_VERSION}"
-    set_env "$ENV_FILE" DEFAULT_IMAGE "${IMAGE_PREFIX}/agent-compose-guest:${IMAGE_VERSION}"
-  elif [ -f "$MANIFEST" ]; then
-    while IFS='=' read -r key value; do
-      case "$key" in
-        AGENT_COMPOSE_IMAGE|AGENT_COMPOSE_FRONTEND_IMAGE|DEFAULT_IMAGE)
-          set_env "$ENV_FILE" "$key" "$value" ;;
-      esac
-    done < "$MANIFEST"
-  fi
+  apply_image_refs "$ENV_FILE" overwrite
   [ -n "$PORT" ] && set_env "$ENV_FILE" AGENT_COMPOSE_HTTP_PORT "$PORT"
 else
-  warn "$ENV_FILE already exists; leaving credentials and settings untouched"
+  warn "$ENV_FILE already exists; preserving configured settings"
+  if [ -z "$(get_env "$ENV_FILE" AUTH_SECRET)" ]; then
+    set_env "$ENV_FILE" AUTH_SECRET "$(gen_hex 32)"
+    log "Generated missing AUTH_SECRET in $ENV_FILE"
+  fi
+  if [ "$NO_AUTH" -eq 1 ]; then
+    set_env "$ENV_FILE" AUTH_PASSWORD ""
+    warn "running without authentication (--no-auth); bind to loopback / trusted networks only"
+  elif [ -z "$(get_env "$ENV_FILE" AUTH_PASSWORD)" ]; then
+    GENERATED_PASSWORD="$(gen_password)"
+    set_env "$ENV_FILE" AUTH_PASSWORD "$GENERATED_PASSWORD"
+    log "Generated missing AUTH_PASSWORD in $ENV_FILE"
+  fi
+  if [ "$UPGRADE" -eq 1 ]; then
+    apply_image_refs "$ENV_FILE" overwrite
+  else
+    apply_image_refs "$ENV_FILE" set-missing
+  fi
   [ -n "$PORT" ] && set_env "$ENV_FILE" AGENT_COMPOSE_HTTP_PORT "$PORT"
 fi
 

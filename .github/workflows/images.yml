@@ -1,4 +1,4 @@
-name: Images
+name: Images & Release
 
 on:
   pull_request:
@@ -6,6 +6,8 @@ on:
       - .github/workflows/images.yml
       - Dockerfile
       - cmd/**
+      - deploy/**
+      - docker-compose.deploy.yml
       - frontend/**
       - guest-images/**
       - go.mod
@@ -36,12 +38,19 @@ env:
   GOPROXY: https://goproxy.cn,direct
 
 jobs:
-  images:
-    name: Build ${{ matrix.name }}
-    runs-on: ubuntu-latest
+  # Build each image for a single architecture on a native runner, then push by
+  # digest. Native arm64 runners avoid slow QEMU emulation of the Rust-based
+  # microsandbox build stage. The manifest list is assembled in the merge job.
+  build:
+    name: Build ${{ matrix.name }} (${{ matrix.platform.tag }})
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
+        name: [agent-compose, agent-compose-frontend, agent-compose-guest]
+        platform:
+          - { tag: linux/amd64, arch: amd64, runner: ubuntu-latest }
+          - { tag: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
         include:
           - name: agent-compose
             image: agent-compose
@@ -65,11 +74,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -78,16 +82,200 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform.tag }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           build-args: |
             VERSION=${{ github.ref_name }}
             REGISTRY_MIRROR=${{ env.REGISTRY_MIRROR }}
             GOPROXY=${{ env.GOPROXY }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.platform.arch }}
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combine the per-arch digests into a single multi-arch manifest per image.
+  merge:
+    name: Merge ${{ matrix.image }} manifest
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [agent-compose, agent-compose-frontend, agent-compose-guest]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_PREFIX }}/${{ matrix.image }}@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+  binary:
+    name: Build binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="$(git describe --always --tags --long 2>/dev/null || git rev-parse --short=12 HEAD)"
+          fi
+          package="agent-compose-${version}-${GOOS}-${GOARCH}"
+          mkdir -p "dist/${package}"
+          go build \
+            -trimpath \
+            -tags netgo,osusergo \
+            -ldflags "-s -w -X agent-compose/pkg/config.BuildVersion=${version}" \
+            -o "dist/${package}/agent-compose" \
+            ./cmd/agent-compose
+          go version -m "dist/${package}/agent-compose"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          sha256sum "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-compose-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # Publish the installer assets. The stack pulls its multi-arch images from the
+  # registry at install time, so no per-arch image artifacts are shipped here.
+  release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs:
+      - binary
+      - merge
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: agent-compose-*
+          merge-multiple: true
+      - name: Build installer assets
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq makeself
+          out="${PWD}/upload"
+          mkdir -p "${out}"
+          find release-assets -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} "${out}/" \;
+
+          # Standalone installer script for the `curl ... | bash` one-liner.
+          cp deploy/install.sh "${out}/install.sh"
+
+          # Arch-agnostic installer payload: deploy files + image manifest that
+          # pins the compose image refs to this release. install.sh pulls the
+          # multi-arch images from the registry.
+          payload="$(mktemp -d)/agent-compose-installer"
+          mkdir -p "${payload}/nginx" "${payload}/images"
+          cp docker-compose.deploy.yml "${payload}/docker-compose.yml"
+          cp nginx/nginx.conf "${payload}/nginx/nginx.conf"
+          cp deploy/.env.example deploy/README.md deploy/install.sh "${payload}/"
+          chmod +x "${payload}/install.sh"
+          {
+            echo "AGENT_COMPOSE_IMAGE=${IMAGE_PREFIX}/agent-compose:${VERSION}"
+            echo "AGENT_COMPOSE_FRONTEND_IMAGE=${IMAGE_PREFIX}/agent-compose-frontend:${VERSION}"
+            echo "DEFAULT_IMAGE=${IMAGE_PREFIX}/agent-compose-guest:${VERSION}"
+          } > "${payload}/images/manifest.env"
+
+          # Tar archive (used by `curl | bash` remote mode) and a single-file
+          # self-extracting installer.
+          tar -C "$(dirname "${payload}")" -czf "${out}/agent-compose-installer.tar.gz" agent-compose-installer
+          makeself --gzip "${payload}" "${out}/agent-compose-installer.run" \
+            "agent-compose installer ${VERSION}" ./install.sh
+
+          ( cd "${out}" && sha256sum ./*.tar.gz ./*.run > SHASUMS256.txt )
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" upload/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" upload/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "agent-compose ${GITHUB_REF_NAME}" \
+              --notes "Release ${GITHUB_REF_NAME}."
+          fi
