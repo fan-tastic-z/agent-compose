@@ -63,6 +63,7 @@ type Config struct {
 	LLMAPIKey                 string
 	LLMModel                  string
 	LLMTimeout                time.Duration
+	RuntimeBaseURL            string
 	AgentTimeout              time.Duration
 	LoaderRunTimeout          time.Duration
 	RuntimeDriver             string
@@ -147,6 +148,7 @@ func NewConfig(di do.Injector) (*Config, error) {
 	llmAPIKey := getenvFirst("LLM_API_KEY", "OPENAI_API_KEY")
 
 	llmModel := os.Getenv("LLM_MODEL")
+	runtimeBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGENT_COMPOSE_RUNTIME_BASE_URL")), "/")
 
 	llmTimeout := 60 * time.Second
 	if raw := os.Getenv("LLM_TIMEOUT"); raw != "" {
@@ -450,6 +452,7 @@ func NewConfig(di do.Injector) (*Config, error) {
 		LLMAPIKey:                 llmAPIKey,
 		LLMModel:                  llmModel,
 		LLMTimeout:                llmTimeout,
+		RuntimeBaseURL:            runtimeBaseURL,
 		AgentTimeout:              agentTimeout,
 		LoaderRunTimeout:          loaderRunTimeout,
 		RuntimeDriver:             runtimeDriver,

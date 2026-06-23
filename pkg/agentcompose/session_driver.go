@@ -17,6 +17,7 @@ type Driver interface {
 type SessionDriver struct {
 	config   *appconfig.Config
 	store    *Store
+	configDB *ConfigStore
 	runtimes RuntimeProvider
 }
 
@@ -24,6 +25,7 @@ func NewDriver(di do.Injector) (Driver, error) {
 	return &SessionDriver{
 		config:   do.MustInvoke[*appconfig.Config](di),
 		store:    do.MustInvoke[*Store](di),
+		configDB: do.MustInvoke[*ConfigStore](di),
 		runtimes: do.MustInvoke[RuntimeProvider](di),
 	}, nil
 }
@@ -115,6 +117,11 @@ func (d *SessionDriver) StopSessionVM(ctx context.Context, session *Session) err
 	if missing {
 		vmState.BoxID = ""
 	}
+	if d.configDB != nil {
+		if err := d.configDB.RevokeLLMFacadeTokensForSession(ctx, session.Summary.ID); err != nil {
+			return err
+		}
+	}
 	return d.store.SaveVMState(session.Summary.ID, vmState)
 }
 
@@ -122,6 +129,13 @@ func (d *SessionDriver) prepareSessionStart(ctx context.Context, driver string, 
 	prepared, err := driverpkg.PrepareSessionStart(ctx, d.config, driver, toDriverSession(session), toDriverVMState(*vmState))
 	if err != nil {
 		return err
+	}
+	managedEnv, err := ensureSessionLLMFacadeConfig(ctx, d.config, d.configDB, session, "codex", "", "session", "")
+	if err != nil {
+		return err
+	}
+	if len(managedEnv) > 0 {
+		session.RuntimeEnvItems = envItemsFromMap(managedEnv, false)
 	}
 	*vmState = fromDriverVMState(prepared)
 	return nil

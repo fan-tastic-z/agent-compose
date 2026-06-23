@@ -43,6 +43,7 @@ type AuthManager struct {
 	secret         []byte
 	ttl            time.Duration
 	bypass         func(*http.Request) bool
+	skipper        func(*http.Request) bool
 	oauthEnabled   bool
 	oauthUser      string
 	oauthUserInfo  string
@@ -57,6 +58,7 @@ type Config struct {
 	AuthSecret            string
 	AuthSessionTTL        time.Duration
 	Bypass                func(*http.Request) bool
+	Skipper               func(*http.Request) bool
 	OAuthAPIKey           string
 	OAuthSecret           string
 	OAuthScopes           []string
@@ -82,6 +84,7 @@ func NewAuthManager(config *Config) *AuthManager {
 		password:       config.AuthPassword,
 		ttl:            config.AuthSessionTTL,
 		bypass:         config.Bypass,
+		skipper:        config.Skipper,
 		oauthStateTTL:  5 * time.Minute,
 		oauthCookieTTL: config.AuthSessionTTL,
 	}
@@ -149,6 +152,9 @@ func (a *AuthManager) RegisterRoutes(e *echo.Echo) {
 func (a *AuthManager) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		if !a.enabled || isPublicAuthPath(c.Request().URL.Path) {
+			return next(c)
+		}
+		if a.skipper != nil && a.skipper(c.Request()) {
 			return next(c)
 		}
 		if a.bypass != nil && a.bypass(c.Request()) {

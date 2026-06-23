@@ -615,7 +615,7 @@ func (r *microsandboxRuntime) createSandbox(ctx context.Context, session *Sessio
 	} else if ok {
 		imageRef = resolvedRef
 	}
-	env := sessionEnvMap(session.EnvItems)
+	env := sessionEnvMap(session.EnvItems, session.RuntimeEnvItems)
 	if env == nil {
 		env = map[string]string{}
 	}

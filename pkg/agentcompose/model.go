@@ -26,12 +26,16 @@ type SessionEnvVar struct {
 	Secret bool   `json:"secret,omitempty"`
 }
 
-func sessionEnvMap(items []SessionEnvVar) map[string]string {
-	if len(items) == 0 {
+func sessionEnvMap(groups ...[]SessionEnvVar) map[string]string {
+	var merged []SessionEnvVar
+	for _, items := range groups {
+		merged = append(merged, items...)
+	}
+	if len(merged) == 0 {
 		return nil
 	}
-	env := make(map[string]string, len(items))
-	for _, item := range items {
+	env := make(map[string]string, len(merged))
+	for _, item := range merged {
 		name := strings.TrimSpace(item.Name)
 		if name == "" {
 			continue
@@ -91,11 +95,25 @@ type SessionWorkspace struct {
 }
 
 type Session struct {
-	Summary       SessionSummary    `json:"summary"`
-	BaseWorkspace string            `json:"base_workspace,omitempty"`
-	WorkspaceID   string            `json:"workspace_id,omitempty"`
-	Workspace     *SessionWorkspace `json:"workspace,omitempty"`
-	EnvItems      []SessionEnvVar   `json:"env_items,omitempty"`
+	Summary          SessionSummary    `json:"summary"`
+	BaseWorkspace    string            `json:"base_workspace,omitempty"`
+	WorkspaceID      string            `json:"workspace_id,omitempty"`
+	Workspace        *SessionWorkspace `json:"workspace,omitempty"`
+	EnvItems         []SessionEnvVar   `json:"env_items,omitempty"`
+	RuntimeEnvItems  []SessionEnvVar   `json:"-"`
+	ProviderEnvItems []SessionEnvVar   `json:"-"`
+}
+
+func restoreSessionTransientFields(dst, src *Session) {
+	if dst == nil || src == nil {
+		return
+	}
+	if len(src.RuntimeEnvItems) > 0 {
+		dst.RuntimeEnvItems = append([]SessionEnvVar(nil), src.RuntimeEnvItems...)
+	}
+	if len(src.ProviderEnvItems) > 0 {
+		dst.ProviderEnvItems = append([]SessionEnvVar(nil), src.ProviderEnvItems...)
+	}
 }
 
 type WorkspaceConfig struct {

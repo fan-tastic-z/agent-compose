@@ -107,7 +107,7 @@ func (s *Service) runProjectAgent(ctx context.Context, msg *agentcomposev2.RunAg
 	if err != nil {
 		return ProjectRunRecord{}, nil, connect.NewError(connect.CodeInternal, err)
 	}
-	agentProvider, err := s.projectRunAgentProvider(ctx, run)
+	agentDefinition, err := s.projectRunAgentDefinition(ctx, run)
 	if err != nil {
 		run, markErr := coordinator.MarkFailed(ctx, ProjectRunTransitionRequest{
 			RunID:     run.RunID,
@@ -119,6 +119,10 @@ func (s *Service) runProjectAgent(ctx context.Context, msg *agentcomposev2.RunAg
 			return ProjectRunRecord{}, nil, connect.NewError(connect.CodeInternal, markErr)
 		}
 		return run, err, nil
+	}
+	agentProvider := normalizeAgentKind(agentDefinition.Provider)
+	if agentProvider == "" {
+		agentProvider = defaultAgentProvider
 	}
 	if s.executor == nil {
 		err = fmt.Errorf("executor is required")
@@ -136,6 +140,8 @@ func (s *Service) runProjectAgent(ctx context.Context, msg *agentcomposev2.RunAg
 	cell, _, _, execErr := s.executor.ExecuteAgentRequest(ctx, sessionResult.Session, ExecuteAgentRequest{
 		Agent:             agentProvider,
 		AgentDefinitionID: run.ManagedAgentID,
+		Model:             agentDefinition.Model,
+		RunID:             run.RunID,
 		Message:           msg.GetPrompt(),
 		OutputSchemaJSON:  msg.GetOutputSchemaJson(),
 		Stream:            projectRunAgentExecutionStream(run, stream),
@@ -157,16 +163,12 @@ func (s *Service) runProjectAgent(ctx context.Context, msg *agentcomposev2.RunAg
 	return run, nil, nil
 }
 
-func (s *Service) projectRunAgentProvider(ctx context.Context, run ProjectRunRecord) (string, error) {
+func (s *Service) projectRunAgentDefinition(ctx context.Context, run ProjectRunRecord) (AgentDefinition, error) {
 	agent, err := s.configDB.GetAgentDefinition(ctx, run.ManagedAgentID)
 	if err != nil {
-		return "", fmt.Errorf("resolve managed agent definition %s: %w", run.ManagedAgentID, err)
+		return AgentDefinition{}, fmt.Errorf("resolve managed agent definition %s: %w", run.ManagedAgentID, err)
 	}
-	provider := normalizeAgentKind(agent.Provider)
-	if provider == "" {
-		provider = defaultAgentProvider
-	}
-	return provider, nil
+	return agent, nil
 }
 
 func projectRunAgentExecutionStream(run ProjectRunRecord, sink *projectRunStreamSink) AgentExecutionStream {

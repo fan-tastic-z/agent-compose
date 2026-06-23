@@ -164,6 +164,7 @@ func installDaemonMiddleware(app *echo.Echo, conf *config.Config) {
 		OAuthUserInfoURL:      conf.OAuthUserInfoURL,
 		OAuthClientAuthMethod: conf.OAuthClientAuthMethod,
 		Bypass:                isLocalUnixSocketRequest,
+		Skipper:               agentcompose.IsRuntimeLLMFacadeRequest,
 	})
 	authManager.RegisterRoutes(app)
 	app.Use(authManager.Middleware)
@@ -179,7 +180,7 @@ func installDaemonMiddleware(app *echo.Echo, conf *config.Config) {
 			// Same local-trust rule as AuthManager: CLI requests over the Unix
 			// socket skip basic auth too.
 			Skipper: func(c echo.Context) bool {
-				return isLocalUnixSocketRequest(c.Request())
+				return isLocalUnixSocketRequest(c.Request()) || agentcompose.IsRuntimeLLMFacadeRequest(c.Request())
 			},
 			Realm: "Password Required",
 			Validator: func(u, p string, c echo.Context) (bool, error) {

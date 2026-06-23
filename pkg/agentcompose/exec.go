@@ -40,6 +40,8 @@ type AgentExecutionStream struct {
 type ExecuteAgentRequest struct {
 	Agent             string
 	AgentDefinitionID string
+	Model             string
+	RunID             string
 	Message           string
 	Timeout           time.Duration
 	OutputSchemaJSON  string
@@ -848,7 +850,7 @@ func (e *Executor) executeAgent(ctx context.Context, session *Session, request E
 		}
 	}
 
-	execResult, result, err := e.executeAgentRun(execCtx, session, agent, request.AgentDefinitionID, message, request.OutputSchemaJSON, streamWriter)
+	execResult, result, err := e.executeAgentRun(execCtx, session, agent, request.AgentDefinitionID, request.Model, request.RunID, message, request.OutputSchemaJSON, streamWriter)
 	streamErrMu.Lock()
 	deferredStreamErr := streamErr
 	streamErrMu.Unlock()

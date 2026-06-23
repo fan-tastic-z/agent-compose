@@ -316,7 +316,7 @@ func TestExecuteAgentRunWritesConventionSystemPromptBeforeExec(t *testing.T) {
 		},
 	}
 
-	result, parsed, err := executor.executeAgentRun(ctx, session, "codex", agent.ID, "hello", "", nil)
+	result, parsed, err := executor.executeAgentRun(ctx, session, "codex", agent.ID, "", "", "hello", "", nil)
 	if err != nil {
 		t.Fatalf("executeAgentRun returned error: %v", err)
 	}

@@ -59,6 +59,7 @@ Daemon LLM client (`LLMService`, `scheduler.llm`, SDK `runtime.llm`):
 - `LLM_API_ENDPOINT`, `LLM_API_KEY`, `OPENAI_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT`
 - `LLM_API_PROTOCOL`: `responses` (default) or `chat_completions` for OpenAI-compatible backends (aliases: `chat`, `chat_completion`)
 - `chat_completions` structured output uses prompt guidance + `json_object`; use `responses` for strict JSON Schema enforcement
+- Runtime LLM Facade bootstrap also supports `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_ENDPOINT`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, and optional guest-reachable `AGENT_COMPOSE_RUNTIME_BASE_URL`
 - Guest agent providers remain `codex`, `claude`, and `gemini` CLI runners in guest containers
 
 ## Persistence

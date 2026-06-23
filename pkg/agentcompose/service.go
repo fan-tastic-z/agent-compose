@@ -170,6 +170,7 @@ func Register(di do.Injector) {
 	app.Any(path+"*", echo.WrapHandler(handler))
 
 	registerWebhookRoutes(app, service)
+	registerRuntimeLLMFacadeRoutes(app, service)
 	registerProxyRoutes(app, service)
 	registerWorkspaceRoutes(app, service)
 }
@@ -553,6 +554,9 @@ func (s *Service) reconcileSessionRuntimeState(ctx context.Context, session *Ses
 	session.Summary.VMStatus = VMStatusStopped
 	if err := s.store.UpdateSession(ctx, session); err != nil {
 		return nil, err
+	}
+	if s.configDB != nil {
+		_ = s.configDB.RevokeLLMFacadeTokensForSession(ctx, session.Summary.ID)
 	}
 	_ = s.store.AddEvent(ctx, session.Summary.ID, SessionEvent{
 		ID:        uuid.NewString(),
@@ -1191,9 +1195,12 @@ func buildLoaderCommandExecSpec(config *appconfig.Config, session *Session, gues
 
 func buildSessionExecEnv(config *appconfig.Config, session *Session, home string) map[string]string {
 	appconfig.ApplyDefaultGuestPaths(config)
-	env := sessionEnvMap(session.EnvItems)
+	env := runtimeEnvMap(session.EnvItems)
 	if env == nil {
 		env = map[string]string{}
+	}
+	for key, value := range managedRuntimeEnvMap(session.RuntimeEnvItems) {
+		env[key] = value
 	}
 	env["GOPATH"] = "/usr/local/go"
 	env["PATH"] = "/root/.local/bin:/usr/local/go/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1316,7 +1323,7 @@ func (e *Executor) resolveAgentSystemPrompt(ctx context.Context, session *Sessio
 	return strings.TrimSpace(agentDef.SystemPrompt), nil
 }
 
-func (e *Executor) executeAgentRun(ctx context.Context, session *Session, agent, agentDefinitionID, message, outputSchemaJSON string, stream ExecStreamWriter) (ExecResult, AgentRunResult, error) {
+func (e *Executor) executeAgentRun(ctx context.Context, session *Session, agent, agentDefinitionID, model, runID, message, outputSchemaJSON string, stream ExecStreamWriter) (ExecResult, AgentRunResult, error) {
 	if session.Summary.VMStatus != VMStatusRunning {
 		return ExecResult{}, AgentRunResult{}, fmt.Errorf("session is not running")
 	}
@@ -1343,7 +1350,24 @@ func (e *Executor) executeAgentRun(ctx context.Context, session *Session, agent,
 	if err != nil {
 		return ExecResult{}, AgentRunResult{}, err
 	}
-	result, err := runtime.ExecStream(ctx, session, vmState, buildAgentExecSpec(e.config, session, agent, promptPath, schemaPath), stream)
+	spec := buildAgentExecSpec(e.config, session, agent, promptPath, schemaPath)
+	managedEnv, err := ensureSessionLLMFacadeConfig(ctx, e.config, e.configDB, session, agent, model, llmFacadeTokenSourceAgent, runID)
+	if err != nil {
+		return ExecResult{}, AgentRunResult{}, err
+	}
+	if len(managedEnv) > 0 {
+		spec.Env = mergeManagedExecEnv(spec.Env, managedEnv)
+		// The per-run facade token is only needed while this bounded run executes.
+		// Retire it as soon as the run returns so live tokens never accumulate over
+		// the lifetime of a long-running session. Use a detached context because the
+		// run context may already be cancelled (e.g. timeout) by the time this runs.
+		if e.configDB != nil {
+			if token := managedEnv["AGENT_COMPOSE_SESSION_TOKEN"]; token != "" {
+				defer func() { _ = e.configDB.DeleteLLMFacadeToken(context.WithoutCancel(ctx), token) }()
+			}
+		}
+	}
+	result, err := runtime.ExecStream(ctx, session, vmState, spec, stream)
 	if err != nil {
 		return sanitizeAgentExecResult(result), AgentRunResult{}, err
 	}

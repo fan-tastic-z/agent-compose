@@ -79,6 +79,7 @@ func (s *Service) ensureProjectRunSession(ctx context.Context, run ProjectRunRec
 	if err != nil {
 		return ProjectRunSessionResult{}, err
 	}
+	session.ProviderEnvItems = prepared.ProviderEnvItems
 	if err := s.startProjectRunSession(ctx, session, "session.created", "session started for project run"); err != nil {
 		return ProjectRunSessionResult{Session: session, Created: true}, err
 	}
@@ -110,6 +111,7 @@ func (s *Service) startProjectRunSession(ctx context.Context, session *Session, 
 	if err != nil {
 		return err
 	}
+	restoreSessionTransientFields(loaded, session)
 	*session = *loaded
 	return nil
 }

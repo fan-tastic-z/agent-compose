@@ -947,7 +947,7 @@ func (r *cgoBoxRuntime) buildBoxOptions(ctx context.Context, session *Session, v
 	defer freeCommand()
 	C.boxlite_options_set_cmd(options, command, C.int(commandLen))
 
-	baseEnv := sessionEnvMap(session.EnvItems)
+	baseEnv := sessionEnvMap(session.EnvItems, session.RuntimeEnvItems)
 	if baseEnv == nil {
 		baseEnv = map[string]string{}
 	}
