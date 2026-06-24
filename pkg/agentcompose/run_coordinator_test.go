@@ -416,6 +416,45 @@ func TestE2ERunAgentStreamAgentFailurePersistsRun(t *testing.T) {
 	testRunAgentStreamAgentFailurePersistsRun(t)
 }
 
+func TestRunAgentStreamEmptyStdoutFailureIncludesProviderStderr(t *testing.T) {
+	_, service, projectID := setupRunCoordinatorProject(t)
+	runtime := runServiceFakeRuntime(t, service)
+	runtime.agentExitCode = 1
+	runtime.agentNoPayload = true
+	runtime.agentStderr = `Codex provider config error: wire_api = "chat" is no longer supported`
+	client, closeServer := newRunServiceTestClient(t, service)
+	defer closeServer()
+	ctx := context.Background()
+
+	events, err := collectRunAgentStreamEvents(ctx, client, &agentcomposev2.RunAgentRequest{
+		ProjectId:       projectID,
+		AgentName:       "reviewer",
+		Prompt:          "trigger provider config failure",
+		ClientRequestId: "stream-agent-empty-stdout-request",
+	})
+	if err != nil {
+		t.Fatalf("RunAgentStream empty stdout failure returned RPC error: %v", err)
+	}
+	completed := lastRunAgentStreamEvent(events, agentcomposev2.RunAgentStreamEventType_RUN_AGENT_STREAM_EVENT_TYPE_COMPLETED)
+	if completed == nil || completed.GetRun().GetStatus() != agentcomposev2.RunStatus_RUN_STATUS_FAILED {
+		t.Fatalf("completed failure event = %#v events=%#v", completed, events)
+	}
+	if !strings.Contains(completed.GetRun().GetError(), "wire_api") || !strings.Contains(completed.GetRun().GetError(), "chat") {
+		t.Fatalf("completed failure error = %q, want provider stderr", completed.GetRun().GetError())
+	}
+	session, err := service.store.GetSession(ctx, completed.GetRun().GetSessionId())
+	if err != nil {
+		t.Fatalf("GetSession failure returned error: %v", err)
+	}
+	cells, err := service.store.ListCells(ctx, session.Summary.ID)
+	if err != nil {
+		t.Fatalf("ListCells failure returned error: %v", err)
+	}
+	if len(cells) == 0 || !strings.Contains(cells[len(cells)-1].Stderr, "wire_api") {
+		t.Fatalf("failed cell stderr missing provider error: %#v", cells)
+	}
+}
+
 func testRunAgentStreamAgentFailurePersistsRun(t *testing.T) {
 	store, service, projectID := setupRunCoordinatorProject(t)
 	runServiceFakeRuntime(t, service).agentExitCode = 7
@@ -485,6 +524,53 @@ func TestRunAgentStreamSendFailurePersistsTerminalRun(t *testing.T) {
 	}
 	if stored.Status != ProjectRunStatusFailed || stored.CompletedAt.IsZero() || stored.SessionID != run.SessionID {
 		t.Fatalf("stored stream send failure run = %#v", stored)
+	}
+}
+
+func TestRunAgentContextCancelPersistsTerminalRun(t *testing.T) {
+	store, service, projectID := setupRunCoordinatorProject(t)
+	runtime := runServiceFakeRuntime(t, service)
+	runtime.agentWaitForContext = true
+	runtime.agentStdout = "partial agent output\n"
+	runtime.agentStderr = "agent stderr before cancel\n"
+	runtime.agentOutput = runtime.agentStdout + runtime.agentStderr
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var outputAttempts int
+	sink := projectRunStreamSink{
+		send: func(resp *agentcomposev2.RunAgentStreamResponse) error {
+			if resp.GetEventType() == agentcomposev2.RunAgentStreamEventType_RUN_AGENT_STREAM_EVENT_TYPE_OUTPUT {
+				outputAttempts++
+				cancel()
+			}
+			return nil
+		},
+	}
+	run, execErr, err := service.runProjectAgent(ctx, &agentcomposev2.RunAgentRequest{
+		ProjectId:       projectID,
+		AgentName:       "reviewer",
+		Prompt:          "cancel while agent is running",
+		ClientRequestId: "agent-context-cancel-request",
+	}, &sink)
+	if err != nil {
+		t.Fatalf("runProjectAgent returned control-plane error: %v", err)
+	}
+	if !errors.Is(execErr, context.Canceled) {
+		t.Fatalf("runProjectAgent execErr = %v, want context canceled", execErr)
+	}
+	if outputAttempts != 1 {
+		t.Fatalf("output send attempts = %d, want 1", outputAttempts)
+	}
+	if run.Status != ProjectRunStatusFailed || run.SessionID == "" || run.CompletedAt.IsZero() || !strings.Contains(run.Error, "context canceled") {
+		t.Fatalf("canceled run = %#v", run)
+	}
+	stored, err := store.GetProjectRun(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatalf("GetProjectRun canceled run returned error: %v", err)
+	}
+	if stored.Status != ProjectRunStatusFailed || stored.CompletedAt.IsZero() || stored.SessionID != run.SessionID || !strings.Contains(stored.Error, "context canceled") {
+		t.Fatalf("stored canceled run = %#v", stored)
 	}
 }
 
