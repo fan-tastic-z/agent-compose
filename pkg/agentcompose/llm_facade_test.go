@@ -1,0 +1,1552 @@
+package agentcompose
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/labstack/echo/v4"
+
+	appconfig "agent-compose/pkg/config"
+	agentcomposev1 "agent-compose/proto/agentcompose/v1"
+)
+
+func TestIsRuntimeLLMFacadeRequestMatchesOnlyRegisteredPOSTRoutes(t *testing.T) {
+	valid := []string{
+		"/api/runtime/sessions/session-1/llm/openai/v1/responses",
+		"/api/runtime/sessions/session-1/llm/openai/v1/chat/completions",
+		"/api/runtime/sessions/session-1/llm/anthropic/v1/messages",
+	}
+	for _, path := range valid {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		if !IsRuntimeLLMFacadeRequest(req) {
+			t.Fatalf("IsRuntimeLLMFacadeRequest(%q) = false, want true", path)
+		}
+	}
+
+	invalid := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/runtime/sessions/session-1/llm/openai/v1/responses"},
+		{http.MethodPost, "/api/runtime/sessions/session-1/llm/openai/v1/responses/extra"},
+		{http.MethodPost, "/api/runtime/sessions/session-1/not-llm/openai/v1/responses"},
+		{http.MethodPost, "/api/runtime/sessions/session-1/llm/openai/v1/unknown"},
+		{http.MethodPost, "/api/runtime/sessions/session-1/llm/anthropic/v1/messages/extra"},
+		{http.MethodPost, "/api/other/session-1/llm/openai/v1/responses"},
+	}
+	for _, tc := range invalid {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		if IsRuntimeLLMFacadeRequest(req) {
+			t.Fatalf("IsRuntimeLLMFacadeRequest(%s %q) = true, want false", tc.method, tc.path)
+		}
+	}
+}
+
+func TestRuntimeLLMFacadeForwardsWithSessionToken(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.LLMAPIKey = "provider-key"
+
+	var gotAuth string
+	var gotRuntimeAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotRuntimeAuth = r.Header.Get("X-Runtime-Auth")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-facade","model":"model-a","status":"completed","output_text":"ok"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	service.config.LLMAPIEndpoint = upstream.URL
+	service.llm.client = upstream.Client()
+
+	session, err := service.store.CreateSession(ctx, "facade", "", "boxlite", "guest:latest", "", SessionTypeManual, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	session.Summary.VMStatus = VMStatusRunning
+	if err := service.store.UpdateSession(ctx, session); err != nil {
+		t.Fatalf("UpdateSession returned error: %v", err)
+	}
+	tokenValue, token, err := newLLMFacadeToken(session.Summary.ID, "model-a", "default", llmAPIProtocolResponses, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	token.ExpiresAt = time.Now().Add(time.Hour)
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/openai/v1/responses", bytes.NewBufferString(`{"model":"model-a","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+tokenValue)
+	req.Header.Set("X-Runtime-Auth", "should-not-forward")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("facade status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotAuth != "Bearer provider-key" {
+		t.Fatalf("upstream Authorization = %q, want provider auth", gotAuth)
+	}
+	if gotRuntimeAuth != "" {
+		t.Fatalf("runtime sensitive header forwarded: %q", gotRuntimeAuth)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/openai/v1/responses", bytes.NewBufferString(`{"model":"model-a","input":"hello"}`))
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token status = %d, want 401", rec.Code)
+	}
+}
+
+func TestRuntimeLLMFacadeFlushesSSEResponses(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.LLMAPIKey = "provider-key"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event: message\ndata: hello\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("event: done\ndata: [DONE]\n\n"))
+	}))
+	t.Cleanup(upstream.Close)
+	service.config.LLMAPIEndpoint = upstream.URL
+	service.llm.client = upstream.Client()
+
+	session, err := service.store.CreateSession(ctx, "facade-sse", "", "boxlite", "guest:latest", "", SessionTypeManual, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	session.Summary.VMStatus = VMStatusRunning
+	if err := service.store.UpdateSession(ctx, session); err != nil {
+		t.Fatalf("UpdateSession returned error: %v", err)
+	}
+	tokenValue, token, err := newLLMFacadeToken(session.Summary.ID, "model-a", "default", llmAPIProtocolResponses, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	token.ExpiresAt = time.Now().Add(time.Hour)
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/openai/v1/responses", bytes.NewBufferString(`{"model":"model-a","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+tokenValue)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("facade status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !rec.Flushed {
+		t.Fatalf("sse response was not flushed")
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "event: raw") || !strings.Contains(body, "event: response.completed") {
+		t.Fatalf("unexpected SSE body: %q", body)
+	}
+}
+
+func TestRuntimeLLMAnthropicFacadeForwardsWithSessionToken(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	var gotAPIKey string
+	var gotAuth string
+	var gotVersion string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("upstream path = %q, want /v1/messages", r.URL.Path)
+		}
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotAuth = r.Header.Get("Authorization")
+		gotVersion = r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_facade","type":"message","model":"claude-test","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	service.llm.client = upstream.Client()
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "anthropic",
+		Name:           "anthropic",
+		ProviderType:   llmProviderFamilyAnthropic,
+		DefaultWireAPI: llmAPIProtocolMessages,
+		BaseURL:        upstream.URL,
+		APIKey:         "provider-key",
+		AuthHeader:     "x-api-key",
+		AuthScheme:     "",
+		HeadersJSON:    `{"anthropic-version":"2023-06-01"}`,
+		Weight:         10,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "claude-test", Name: "claude-test", Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig returned error: %v", err)
+	}
+
+	session, err := service.store.CreateSession(ctx, "facade-claude", "", "boxlite", "guest:latest", "", SessionTypeManual, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	session.Summary.VMStatus = VMStatusRunning
+	if err := service.store.UpdateSession(ctx, session); err != nil {
+		t.Fatalf("UpdateSession returned error: %v", err)
+	}
+	tokenValue, token, err := newLLMFacadeToken(session.Summary.ID, "claude-test", "anthropic", llmAPIProtocolMessages, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	token.ExpiresAt = time.Now().Add(time.Hour)
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/anthropic/v1/messages", bytes.NewBufferString(`{"model":"claude-test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("x-api-key", tokenValue)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("facade status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotAPIKey != "provider-key" {
+		t.Fatalf("upstream x-api-key = %q, want provider key", gotAPIKey)
+	}
+	if gotAuth != "" {
+		t.Fatalf("runtime Authorization forwarded to anthropic upstream: %q", gotAuth)
+	}
+	if gotVersion != "2023-06-01" {
+		t.Fatalf("upstream anthropic-version = %q, want 2023-06-01", gotVersion)
+	}
+}
+
+func TestRuntimeLLMOpenAIResponsesFacadeBridgesToAnthropicProvider(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	var gotPath string
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		if r.Header.Get("x-api-key") != "provider-key" {
+			t.Errorf("upstream x-api-key = %q, want provider-key", r.Header.Get("x-api-key"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_bridge","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"bridged"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	service.llm.client = upstream.Client()
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "anthropic",
+		Name:           "anthropic",
+		ProviderType:   llmProviderFamilyAnthropic,
+		DefaultWireAPI: llmAPIProtocolMessages,
+		BaseURL:        upstream.URL,
+		APIKey:         "provider-key",
+		AuthHeader:     "x-api-key",
+		AuthScheme:     "",
+		HeadersJSON:    `{"anthropic-version":"2023-06-01"}`,
+		Weight:         1,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "claude-test", Name: "claude-test", Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig returned error: %v", err)
+	}
+	session := createRunningLLMFacadeSession(t, ctx, service, "bridge-openai-anthropic")
+	tokenValue, token, err := newLLMFacadeToken(session.Summary.ID, "claude-test", "anthropic", llmAPIProtocolResponses, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	token.ExpiresAt = time.Now().Add(time.Hour)
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/openai/v1/responses", bytes.NewBufferString(`{"model":"claude-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer "+tokenValue)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("facade status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/v1/messages" {
+		t.Fatalf("upstream path = %q, want /v1/messages", gotPath)
+	}
+	if !strings.Contains(gotBody, `"messages"`) || !strings.Contains(gotBody, `"model":"claude-test"`) {
+		t.Fatalf("upstream body was not anthropic messages: %s", gotBody)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"object":"response"`) || !strings.Contains(body, "bridged") {
+		t.Fatalf("facade body was not openai responses: %s", body)
+	}
+}
+
+func TestRuntimeLLMAnthropicFacadeBridgesToOpenAIResponsesProvider(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	var gotPath string
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		if r.Header.Get("Authorization") != "Bearer provider-key" {
+			t.Errorf("upstream Authorization = %q, want provider auth", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_bridge","object":"response","status":"completed","model":"gpt-test","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"bridged"}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	service.llm.client = upstream.Client()
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "default",
+		Name:           "default",
+		ProviderType:   llmProviderFamilyOpenAI,
+		DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL:        upstream.URL,
+		APIKey:         "provider-key",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "Bearer",
+		HeadersJSON:    `{}`,
+		Weight:         1,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "gpt-test", Name: "gpt-test", Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig returned error: %v", err)
+	}
+	session := createRunningLLMFacadeSession(t, ctx, service, "bridge-anthropic-openai")
+	tokenValue, token, err := newLLMFacadeToken(session.Summary.ID, "gpt-test", "default", llmAPIProtocolMessages, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	token.ExpiresAt = time.Now().Add(time.Hour)
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+session.Summary.ID+"/llm/anthropic/v1/messages", bytes.NewBufferString(`{"model":"gpt-test","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer "+tokenValue)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("facade status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", gotPath)
+	}
+	if !strings.Contains(gotBody, `"input"`) || !strings.Contains(gotBody, `"model":"gpt-test"`) {
+		t.Fatalf("upstream body was not openai responses: %s", gotBody)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"type":"message"`) || !strings.Contains(body, "bridged") {
+		t.Fatalf("facade body was not anthropic messages: %s", body)
+	}
+}
+
+func TestAnthropicProviderCanBootstrapFromGenericLLMAPIKey(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_ENDPOINT", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	t.Setenv("LLM_API_KEY", "generic-provider-key")
+	t.Setenv("LLM_API_ENDPOINT", "https://anthropic.example.invalid/v1/messages")
+
+	target, err := resolveLLMTargetForProviderFamily(ctx, service.config, service.configDB, llmProviderFamilyAnthropic, "claude-test")
+	if err != nil {
+		t.Fatalf("resolveLLMTargetForProviderFamily returned error: %v", err)
+	}
+	if target.Provider.ID != "anthropic" {
+		t.Fatalf("provider id = %q, want anthropic", target.Provider.ID)
+	}
+	if target.Headers.Get("x-api-key") != "generic-provider-key" {
+		t.Fatalf("x-api-key = %q, want generic provider key", target.Headers.Get("x-api-key"))
+	}
+	if target.Provider.BaseURL != "https://anthropic.example.invalid/v1" {
+		t.Fatalf("provider base url = %q, want normalized anthropic base url", target.Provider.BaseURL)
+	}
+	if target.Endpoint != "https://anthropic.example.invalid/v1/messages" {
+		t.Fatalf("endpoint = %q, want anthropic messages endpoint", target.Endpoint)
+	}
+}
+
+func TestRuntimeLLMTargetDoesNotTreatGenericOpenAIEndpointAsAnthropic(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_ENDPOINT", "")
+	t.Setenv("ANTHROPIC_MODEL", "")
+	t.Setenv("CLAUDE_MODEL", "")
+	t.Setenv("LLM_API_KEY", "generic-provider-key")
+	t.Setenv("LLM_API_ENDPOINT", "https://openai.example.invalid/v1/responses")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	target, err := resolveRuntimeLLMTarget(ctx, service.config, service.configDB, "gpt-test", "")
+	if err != nil {
+		t.Fatalf("resolveRuntimeLLMTarget returned error: %v", err)
+	}
+	if target.Provider.ID != "default" {
+		t.Fatalf("provider id = %q, want default openai provider", target.Provider.ID)
+	}
+	if target.Provider.ProviderType != llmProviderFamilyOpenAI {
+		t.Fatalf("provider type = %q, want openai", target.Provider.ProviderType)
+	}
+}
+
+func createRunningLLMFacadeSession(t *testing.T, ctx context.Context, service *Service, title string) *Session {
+	t.Helper()
+	session, err := service.store.CreateSession(ctx, title, "", "boxlite", "guest:latest", "", SessionTypeManual, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	session.Summary.VMStatus = VMStatusRunning
+	if err := service.store.UpdateSession(ctx, session); err != nil {
+		t.Fatalf("UpdateSession returned error: %v", err)
+	}
+	return session
+}
+
+func TestAnthropicProviderCanBootstrapFromAuthToken(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "auth-token")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://aiapi.chaitin.net")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	target, err := resolveLLMTargetForProviderFamily(ctx, service.config, service.configDB, llmProviderFamilyAnthropic, "kimi-k2.6")
+	if err != nil {
+		t.Fatalf("resolveLLMTargetForProviderFamily returned error: %v", err)
+	}
+	if target.Headers.Get("Authorization") != "Bearer auth-token" {
+		t.Fatalf("Authorization = %q, want bearer auth token", target.Headers.Get("Authorization"))
+	}
+	if target.Headers.Get("x-api-key") != "" {
+		t.Fatalf("x-api-key = %q, want empty when auth token is used", target.Headers.Get("x-api-key"))
+	}
+	if target.Provider.BaseURL != "https://aiapi.chaitin.net/v1" {
+		t.Fatalf("provider base url = %q, want normalized aiapi base url", target.Provider.BaseURL)
+	}
+}
+
+func TestProviderForwardHeadersFiltersManagedHeaders(t *testing.T) {
+	headers, err := providerForwardHeaders(LLMProvider{
+		APIKey:      "provider-key",
+		AuthHeader:  "Authorization",
+		AuthScheme:  "Bearer",
+		HeadersJSON: `{"Content-Type":"text/plain","Authorization":"Bearer wrong","X-Provider":"ok"}`,
+	})
+	if err != nil {
+		t.Fatalf("providerForwardHeaders returned error: %v", err)
+	}
+	if got := headers.Get("Content-Type"); got != "" {
+		t.Fatalf("Content-Type = %q, want filtered", got)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer provider-key" {
+		t.Fatalf("Authorization = %q, want provider auth", got)
+	}
+	if got := headers.Get("X-Provider"); got != "ok" {
+		t.Fatalf("X-Provider = %q, want ok", got)
+	}
+}
+
+func TestNewLLMFacadeTokenDoesNotExpireByDefault(t *testing.T) {
+	ctx := context.Background()
+	service, _, _ := newTestServiceAPIHarness(t)
+	tokenValue, token, err := newLLMFacadeToken("session-1", "model-a", "default", llmAPIProtocolResponses, "test", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken returned error: %v", err)
+	}
+	if !token.ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero for session-scoped token", token.ExpiresAt)
+	}
+	if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("SaveLLMFacadeToken returned error: %v", err)
+	}
+	stored, err := service.configDB.GetLLMFacadeToken(ctx, tokenValue)
+	if err != nil {
+		t.Fatalf("GetLLMFacadeToken returned error: %v", err)
+	}
+	if !stored.ExpiresAt.IsZero() {
+		t.Fatalf("stored ExpiresAt = %v, want zero for session-scoped token", stored.ExpiresAt)
+	}
+}
+
+func TestManagedRuntimeEnvMapKeepsFacadeKeyAliases(t *testing.T) {
+	userEnv := runtimeEnvMap([]SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://provider.example.invalid/v1"},
+		{Name: "OPENAI_API_KEY", Value: "provider-key"},
+		{Name: "DATABASE_PASSWORD", Value: "db-secret", Secret: true},
+	})
+	if _, ok := userEnv["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY leaked from user runtime env: %#v", userEnv)
+	}
+	if userEnv["DATABASE_PASSWORD"] != "db-secret" {
+		t.Fatalf("DATABASE_PASSWORD = %q, want db-secret", userEnv["DATABASE_PASSWORD"])
+	}
+
+	managedEnv := managedRuntimeEnvMap([]SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "http://agent-compose.test/api/runtime/sessions/s1/llm/openai/v1"},
+		{Name: "LLM_API_KEY", Value: "facade-token"},
+		{Name: "LLM_API_PROTOCOL", Value: llmAPIProtocolResponses},
+		{Name: "OPENAI_API_KEY", Value: "facade-token"},
+	})
+	if managedEnv["OPENAI_API_KEY"] != "facade-token" {
+		t.Fatalf("managed OPENAI_API_KEY = %q, want facade token", managedEnv["OPENAI_API_KEY"])
+	}
+	if managedEnv["LLM_API_KEY"] != "facade-token" {
+		t.Fatalf("managed LLM_API_KEY = %q, want facade token", managedEnv["LLM_API_KEY"])
+	}
+	if managedEnv["LLM_API_ENDPOINT"] != "http://agent-compose.test/api/runtime/sessions/s1/llm/openai/v1" {
+		t.Fatalf("managed LLM_API_ENDPOINT = %q, want facade endpoint", managedEnv["LLM_API_ENDPOINT"])
+	}
+}
+
+func TestEnsureSessionLLMFacadeConfigUsesRequestedModel(t *testing.T) {
+	ctx := context.Background()
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "default",
+		Name:           "default",
+		ProviderType:   llmProviderFamilyOpenAI,
+		DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL:        "https://llm.example.invalid/v1",
+		APIKey:         "provider-key",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "Bearer",
+		HeadersJSON:    "{}",
+		Weight:         1,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "model-a", Name: "model-a", DefaultModel: true, Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig model-a returned error: %v", err)
+	}
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "default",
+		Name:           "default",
+		ProviderType:   llmProviderFamilyOpenAI,
+		DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL:        "https://llm.example.invalid/v1",
+		APIKey:         "provider-key",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "Bearer",
+		HeadersJSON:    "{}",
+		Weight:         1,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "model-b", Name: "model-b", DefaultModel: false, Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig model-b returned error: %v", err)
+	}
+	session := createRunningLLMFacadeSession(t, ctx, service, "requested-model")
+
+	env, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "model-b", "test", "run-1")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+	if env["AGENT_COMPOSE_SESSION_TOKEN"] == "" {
+		t.Fatalf("AGENT_COMPOSE_SESSION_TOKEN missing from managed env: %#v", env)
+	}
+	if env["LLM_API_KEY"] != env["AGENT_COMPOSE_SESSION_TOKEN"] {
+		t.Fatalf("LLM_API_KEY = %q, want facade token alias", env["LLM_API_KEY"])
+	}
+	if env["LLM_API_ENDPOINT"] != "http://agent-compose.test/api/runtime/sessions/"+session.Summary.ID+"/llm/openai/v1" {
+		t.Fatalf("LLM_API_ENDPOINT = %q, want facade endpoint alias", env["LLM_API_ENDPOINT"])
+	}
+	configPath := filepath.Join(hostSessionHome(session), ".codex", "config.toml")
+	payload, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) returned error: %v", configPath, err)
+	}
+	if !strings.Contains(string(payload), `model = "model-b"`) {
+		t.Fatalf("codex config did not use requested model-b: %s", string(payload))
+	}
+}
+
+func TestEnsureSessionLLMFacadeConfigBootstrapsFromSessionEnvProvider(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-provider-env")
+	session.EnvItems = []SessionEnvVar{{Name: "SAFE_ENV", Value: "safe"}}
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-openai.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-provider-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-model"},
+	}
+
+	env, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-1")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+	if env["AGENT_COMPOSE_SESSION_TOKEN"] == "" {
+		t.Fatalf("AGENT_COMPOSE_SESSION_TOKEN missing from managed env: %#v", env)
+	}
+	if env["LLM_API_KEY"] != env["AGENT_COMPOSE_SESSION_TOKEN"] || env["OPENAI_API_KEY"] != env["AGENT_COMPOSE_SESSION_TOKEN"] {
+		t.Fatalf("managed env did not replace provider keys with facade token: %#v", env)
+	}
+	if strings.Contains(strings.Join([]string{env["LLM_API_KEY"], env["OPENAI_API_KEY"]}, " "), "session-provider-key") {
+		t.Fatalf("session provider key leaked into managed env: %#v", env)
+	}
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("provider count = %d, want 1: %#v", len(providers), providers)
+	}
+	if providers[0].ID != sessionEnvProviderID(session.Summary.ID, llmProviderFamilyOpenAI) || providers[0].Scope != llmProviderScopeSessionEnv {
+		t.Fatalf("provider identity = %#v, want session env provider", providers[0])
+	}
+	if providers[0].APIKey != "session-provider-key" {
+		t.Fatalf("provider API key = %q, want session provider key", providers[0].APIKey)
+	}
+	if providers[0].BaseURL != "https://session-openai.example.invalid/v1" {
+		t.Fatalf("provider base url = %q, want session endpoint", providers[0].BaseURL)
+	}
+	if envMap := sessionEnvMap(session.EnvItems); envMap["LLM_API_KEY"] != "" || envMap["OPENAI_API_KEY"] != "" {
+		t.Fatalf("provider key present in session env: %#v", session.EnvItems)
+	}
+}
+
+func TestSessionEnvProviderDoesNotOverrideConfiguredProvider(t *testing.T) {
+	ctx := context.Background()
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "default",
+		Name:           "default",
+		ProviderType:   llmProviderFamilyOpenAI,
+		DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL:        "https://configured.example.invalid/v1",
+		APIKey:         "configured-key",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "Bearer",
+		HeadersJSON:    "{}",
+		Weight:         1,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "configured-model", Name: "configured-model", DefaultModel: true, Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig returned error: %v", err)
+	}
+	session := createRunningLLMFacadeSession(t, ctx, service, "configured-provider")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-model"},
+	}
+
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "configured-model", "test", "run-1"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("provider count = %d, want 1: %#v", len(providers), providers)
+	}
+	if providers[0].APIKey != "configured-key" || providers[0].BaseURL != "https://configured.example.invalid/v1" {
+		t.Fatalf("configured provider was overridden: %#v", providers[0])
+	}
+}
+
+func TestSessionEnvGenericMessagesEndpointBootstrapsOnlyAnthropicProvider(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-anthropic-provider-env")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-anthropic.example.invalid/v1/messages"},
+		{Name: "LLM_API_KEY", Value: "session-provider-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "claude-session"},
+	}
+
+	env, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "claude", "", "test", "run-1")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+	if env["ANTHROPIC_API_KEY"] != env["AGENT_COMPOSE_SESSION_TOKEN"] {
+		t.Fatalf("ANTHROPIC_API_KEY = %q, want facade token", env["ANTHROPIC_API_KEY"])
+	}
+	if env["ANTHROPIC_MODEL"] != "claude-session" || env["CLAUDE_MODEL"] != "claude-session" {
+		t.Fatalf("claude model env = ANTHROPIC_MODEL:%q CLAUDE_MODEL:%q, want claude-session", env["ANTHROPIC_MODEL"], env["CLAUDE_MODEL"])
+	}
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("provider count = %d, want only anthropic provider: %#v", len(providers), providers)
+	}
+	if providers[0].ID != sessionEnvProviderID(session.Summary.ID, llmProviderFamilyAnthropic) || providers[0].ProviderType != llmProviderFamilyAnthropic || providers[0].Scope != llmProviderScopeSessionEnv {
+		t.Fatalf("provider = %#v, want session-scoped anthropic provider", providers[0])
+	}
+	if providers[0].BaseURL != "https://session-anthropic.example.invalid/v1" {
+		t.Fatalf("provider base url = %q, want normalized anthropic base url", providers[0].BaseURL)
+	}
+}
+
+func TestSessionEnvProvidersAreScopedPerSession(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+
+	sessionA := createRunningLLMFacadeSession(t, ctx, service, "session-env-a")
+	sessionA.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-a.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-key-a", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-model-a"},
+	}
+	sessionB := createRunningLLMFacadeSession(t, ctx, service, "session-env-b")
+	sessionB.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-b.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-key-b", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-model-b"},
+	}
+
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, sessionA, "codex", "", "test", "run-a"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig(session A) returned error: %v", err)
+	}
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, sessionB, "codex", "", "test", "run-b"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig(session B) returned error: %v", err)
+	}
+
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	byID := map[string]LLMProvider{}
+	for _, provider := range providers {
+		byID[provider.ID] = provider
+	}
+	providerA := byID[sessionEnvProviderID(sessionA.Summary.ID, llmProviderFamilyOpenAI)]
+	providerB := byID[sessionEnvProviderID(sessionB.Summary.ID, llmProviderFamilyOpenAI)]
+	if providerA.APIKey != "session-key-a" || providerA.BaseURL != "https://session-a.example.invalid/v1" || providerA.Scope != llmProviderScopeSessionEnv {
+		t.Fatalf("session A provider = %#v", providerA)
+	}
+	if providerB.APIKey != "session-key-b" || providerB.BaseURL != "https://session-b.example.invalid/v1" || providerB.Scope != llmProviderScopeSessionEnv {
+		t.Fatalf("session B provider = %#v", providerB)
+	}
+	models, err := service.configDB.ListEnabledLLMModels(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMModels returned error: %v", err)
+	}
+	modelsByID := map[string]bool{}
+	for _, model := range models {
+		modelsByID[model.ID] = true
+	}
+	if !modelsByID["session-model-a"] || !modelsByID["session-model-b"] {
+		t.Fatalf("models = %#v, want both session models", models)
+	}
+}
+
+func TestSessionEnvProviderSelectionUsesAgentFamilyPreference(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_ENDPOINT", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_MODEL", "")
+	t.Setenv("CLAUDE_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-env-agent-family")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-openai.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-openai-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "shared-session-model"},
+		{Name: "ANTHROPIC_BASE_URL", Value: "https://session-anthropic.example.invalid/v1"},
+		{Name: "ANTHROPIC_API_KEY", Value: "session-anthropic-key", Secret: true},
+		{Name: "ANTHROPIC_MODEL", Value: "shared-session-model"},
+	}
+
+	claudeEnv, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "claude", "", "test", "run-claude")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig(claude) returned error: %v", err)
+	}
+	claudeToken, err := service.configDB.GetLLMFacadeToken(ctx, claudeEnv["AGENT_COMPOSE_SESSION_TOKEN"])
+	if err != nil {
+		t.Fatalf("GetLLMFacadeToken(claude) returned error: %v", err)
+	}
+	if claudeToken.ProviderID != sessionEnvProviderID(session.Summary.ID, llmProviderFamilyAnthropic) {
+		t.Fatalf("claude provider id = %q, want anthropic session provider", claudeToken.ProviderID)
+	}
+
+	codexEnv, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-codex")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig(codex) returned error: %v", err)
+	}
+	codexToken, err := service.configDB.GetLLMFacadeToken(ctx, codexEnv["AGENT_COMPOSE_SESSION_TOKEN"])
+	if err != nil {
+		t.Fatalf("GetLLMFacadeToken(codex) returned error: %v", err)
+	}
+	if codexToken.ProviderID != sessionEnvProviderID(session.Summary.ID, llmProviderFamilyOpenAI) {
+		t.Fatalf("codex provider id = %q, want openai session provider", codexToken.ProviderID)
+	}
+}
+
+func TestDaemonEnvProviderSelectionUsesAgentFamilyPreference(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://anthropic.example.invalid")
+	t.Setenv("ANTHROPIC_API_ENDPOINT", "")
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_MODEL", "shared-model")
+	t.Setenv("CLAUDE_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = "https://openai.example.invalid"
+	service.config.LLMAPIKey = "openai-key"
+	service.config.LLMAPIProtocol = llmAPIProtocolChatCompletions
+	service.config.LLMModel = "shared-model"
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "daemon-env-agent-family")
+	env, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-codex")
+	if err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig(codex) returned error: %v", err)
+	}
+	if env["LLM_API_PROTOCOL"] != llmAPIProtocolResponses {
+		t.Fatalf("LLM_API_PROTOCOL = %q, want responses facade wire API", env["LLM_API_PROTOCOL"])
+	}
+	token, err := service.configDB.GetLLMFacadeToken(ctx, env["AGENT_COMPOSE_SESSION_TOKEN"])
+	if err != nil {
+		t.Fatalf("GetLLMFacadeToken returned error: %v", err)
+	}
+	if token.ProviderID != llmProviderIDDefaultOpenAI {
+		t.Fatalf("codex provider id = %q, want default OpenAI provider", token.ProviderID)
+	}
+	if token.WireAPI != llmAPIProtocolResponses {
+		t.Fatalf("codex token wire api = %q, want responses facade wire API", token.WireAPI)
+	}
+}
+
+func TestSessionEnvProviderIsNotSelectedWithoutProviderID(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-env-isolated")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-only.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-only-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-only-model"},
+	}
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-1"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+
+	target, err := resolveLLMTarget(ctx, service.config, service.configDB, "session-only-model")
+	if err != nil {
+		t.Fatalf("resolveLLMTarget returned error: %v", err)
+	}
+	if target.Provider.ID == sessionEnvProviderID(session.Summary.ID, llmProviderFamilyOpenAI) || target.Provider.APIKey == "session-only-key" {
+		t.Fatalf("daemon target selected session env provider: %#v", target.Provider)
+	}
+	if target.Provider.ID != llmProviderIDDefaultOpenAI || target.Provider.Scope != llmProviderScopeEnvDefault {
+		t.Fatalf("daemon target = %#v, want default env provider", target.Provider)
+	}
+}
+
+func TestSessionEnvProviderResolutionWithProviderIDDoesNotBootstrapDefault(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-env-provider-id")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-provider-id.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-provider-id-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "session-provider-id-model"},
+	}
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-1"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+
+	providerID := sessionEnvProviderID(session.Summary.ID, llmProviderFamilyOpenAI)
+	target, err := resolveRuntimeLLMTarget(ctx, service.config, service.configDB, "session-provider-id-model", providerID)
+	if err != nil {
+		t.Fatalf("resolveRuntimeLLMTarget returned error: %v", err)
+	}
+	if target.Provider.ID != providerID {
+		t.Fatalf("target provider = %#v, want session env provider", target.Provider)
+	}
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 || providers[0].ID != providerID {
+		t.Fatalf("providers = %#v, want only session env provider", providers)
+	}
+}
+
+func TestSessionEnvModelOnlyUsesDefaultEnvProvider(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = "https://default-env.example.invalid/v1"
+	service.config.LLMAPIKey = "default-env-key"
+	service.config.LLMModel = ""
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-env-model-only")
+	session.ProviderEnvItems = []SessionEnvVar{{Name: "LLM_MODEL", Value: "session-model-only"}}
+	if _, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "codex", "", "test", "run-1"); err != nil {
+		t.Fatalf("ensureSessionLLMFacadeConfig returned error: %v", err)
+	}
+
+	providers, err := service.configDB.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("provider count = %d, want 1: %#v", len(providers), providers)
+	}
+	if providers[0].ID != llmProviderIDDefaultOpenAI || providers[0].Scope != llmProviderScopeEnvDefault || providers[0].APIKey != "default-env-key" {
+		t.Fatalf("provider = %#v, want default env provider", providers[0])
+	}
+	models, err := service.configDB.ListEnabledLLMModels(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMModels returned error: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "session-model-only" {
+		t.Fatalf("models = %#v, want session model on default env provider", models)
+	}
+}
+
+func TestConfiguredProviderTakesPriorityOverDefaultEnvProvider(t *testing.T) {
+	ctx := context.Background()
+	service, _, _ := newTestServiceAPIHarness(t)
+	if _, err := service.configDB.ReplaceGlobalEnv(ctx, []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://env-default.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "env-default-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "shared-model"},
+	}); err != nil {
+		t.Fatalf("ReplaceGlobalEnv returned error: %v", err)
+	}
+	if _, err := resolveLLMTarget(ctx, service.config, service.configDB, "shared-model"); err != nil {
+		t.Fatalf("resolveLLMTarget(default env) returned error: %v", err)
+	}
+	if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID:             "configured-openai",
+		Name:           "configured-openai",
+		ProviderType:   llmProviderFamilyOpenAI,
+		DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL:        "https://configured-priority.example.invalid/v1",
+		APIKey:         "configured-key",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "Bearer",
+		HeadersJSON:    "{}",
+		Weight:         10,
+		Enabled:        true,
+		Scope:          llmProviderScopeSystem,
+	}, LLMModel{ID: "shared-model", Name: "shared-model", DefaultModel: true, Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig returned error: %v", err)
+	}
+
+	target, err := resolveLLMTarget(ctx, service.config, service.configDB, "shared-model")
+	if err != nil {
+		t.Fatalf("resolveLLMTarget(configured) returned error: %v", err)
+	}
+	if target.Provider.ID != "configured-openai" || target.Provider.APIKey != "configured-key" {
+		t.Fatalf("target provider = %#v, want configured provider", target.Provider)
+	}
+}
+
+func TestGuestRuntimeLLMBaseURLDockerRequiresReachableBaseForLoopback(t *testing.T) {
+	config := &appconfig.Config{HttpListen: "127.0.0.1:7410"}
+	session := &Session{Summary: SessionSummary{Driver: "docker"}}
+	if got := guestRuntimeLLMBaseURL(config, session); got != "" {
+		t.Fatalf("docker loopback base url = %q, want empty without explicit runtime base url", got)
+	}
+
+	config.RuntimeBaseURL = "http://agent-compose:7410"
+	if got := guestRuntimeLLMBaseURL(config, session); got != "http://agent-compose:7410" {
+		t.Fatalf("explicit docker runtime base url = %q, want compose service URL", got)
+	}
+
+	config.RuntimeBaseURL = ""
+	config.HttpListen = "192.0.2.10:7410"
+	if got := guestRuntimeLLMBaseURL(config, session); got != "http://192.0.2.10:7410" {
+		t.Fatalf("docker concrete listen base url = %q, want concrete host URL", got)
+	}
+}
+
+func TestForbiddenRuntimeLLMHeaderDoesNotOvermatchAuthSubstring(t *testing.T) {
+	if forbiddenRuntimeLLMHeader("X-Authored-By") {
+		t.Fatalf("X-Authored-By should not be treated as a sensitive auth header")
+	}
+	if !forbiddenRuntimeLLMHeader("X-Runtime-Auth") {
+		t.Fatalf("X-Runtime-Auth should be treated as sensitive")
+	}
+	if !forbiddenRuntimeLLMHeader("X-Session-Token") {
+		t.Fatalf("X-Session-Token should be treated as sensitive")
+	}
+}
+
+func TestCreateSessionFiltersLLMProviderKeysFromPersistedEnv(t *testing.T) {
+	ctx := context.Background()
+	service, _, _ := newTestServiceAPIHarness(t)
+	if _, err := service.configDB.ReplaceGlobalEnv(ctx, []SessionEnvVar{
+		{Name: "OPENAI_API_KEY", Value: "global-provider-key", Secret: false},
+		{Name: "ANTHROPIC_AUTH_TOKEN", Value: "global-provider-key", Secret: false},
+		{Name: "GOOGLE_API_KEY", Value: "global-provider-key", Secret: false},
+		{Name: "SAFE_ENV", Value: "safe", Secret: false},
+		{Name: "SAFE_SECRET_ENV", Value: "safe-secret", Secret: true},
+	}); err != nil {
+		t.Fatalf("ReplaceGlobalEnv returned error: %v", err)
+	}
+	resp, err := service.sessions.CreateSession(ctx, connect.NewRequest(&agentcomposev1.CreateSessionRequest{
+		Title: "env-filter",
+		EnvItems: []*agentcomposev1.SessionEnvVar{
+			{Name: "LLM_API_KEY", Value: "request-provider-key", Secret: false},
+			{Name: "GEMINI_API_KEY", Value: "request-provider-key", Secret: false},
+			{Name: "REQUEST_ENV", Value: "request", Secret: false},
+			{Name: "REQUEST_SECRET_ENV", Value: "request-secret", Secret: true},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	session, err := service.store.GetSession(ctx, resp.Msg.GetSession().GetSummary().GetSessionId())
+	if err != nil {
+		t.Fatalf("GetSession returned error: %v", err)
+	}
+	env := sessionEnvMap(session.EnvItems)
+	for _, name := range []string{"OPENAI_API_KEY", "LLM_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GOOGLE_API_KEY", "GEMINI_API_KEY"} {
+		if _, ok := env[name]; ok {
+			t.Fatalf("%s persisted in session env: %#v", name, session.EnvItems)
+		}
+	}
+	if env["SAFE_ENV"] != "safe" || env["REQUEST_ENV"] != "request" {
+		t.Fatalf("safe env missing after filter: %#v", session.EnvItems)
+	}
+	if env["SAFE_SECRET_ENV"] != "safe-secret" || env["REQUEST_SECRET_ENV"] != "request-secret" {
+		t.Fatalf("non-LLM secret env missing after filter: %#v", session.EnvItems)
+	}
+	for _, item := range session.EnvItems {
+		if strings.Contains(item.Value, "provider-key") {
+			t.Fatalf("provider key value persisted: %#v", session.EnvItems)
+		}
+	}
+}
+
+func TestRuntimeEnvMapKeepsNonLLMSecretEnv(t *testing.T) {
+	env := runtimeEnvMap([]SessionEnvVar{
+		{Name: "DATABASE_PASSWORD", Value: "db-secret", Secret: true},
+		{Name: "OPENAI_API_KEY", Value: "provider-key", Secret: true},
+	})
+	if env["DATABASE_PASSWORD"] != "db-secret" {
+		t.Fatalf("DATABASE_PASSWORD = %q, want non-LLM secret env to be preserved", env["DATABASE_PASSWORD"])
+	}
+	if _, ok := env["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY leaked into runtime env: %#v", env)
+	}
+}
+
+func TestEnsureSessionAnthropicEnvProviderAuthUsesSessionEnvOnly(t *testing.T) {
+	// A session-env Anthropic provider derives its API key only from session env
+	// items, so its auth header choice must depend only on those items too. A
+	// daemon-level ANTHROPIC_API_KEY must not flip a session token provider to
+	// the x-api-key header.
+	t.Setenv("ANTHROPIC_API_KEY", "daemon-api-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+
+	store := newTestConfigStore(t)
+	ctx := context.Background()
+	sessionID := "sess-anthropic-auth"
+	envItems := []SessionEnvVar{
+		{Name: "ANTHROPIC_AUTH_TOKEN", Value: "session-auth-token"},
+		{Name: "ANTHROPIC_MODEL", Value: "claude-test"},
+	}
+	providerID, err := ensureSessionAnthropicEnvProvider(ctx, store, sessionID, "", envItems)
+	if err != nil {
+		t.Fatalf("ensureSessionAnthropicEnvProvider returned error: %v", err)
+	}
+	if providerID == "" {
+		t.Fatalf("expected a session anthropic provider to be created")
+	}
+	providers, err := store.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	var found *LLMProvider
+	for i := range providers {
+		if providers[i].ID == providerID {
+			found = &providers[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("session anthropic provider %q not found", providerID)
+	}
+	if found.AuthHeader != "Authorization" || found.AuthScheme != "Bearer" {
+		t.Fatalf("session provider auth = %q/%q, want Authorization/Bearer (session env has only ANTHROPIC_AUTH_TOKEN)", found.AuthHeader, found.AuthScheme)
+	}
+}
+
+func TestRevokeLLMFacadeTokensForSessionPrunesDeadRows(t *testing.T) {
+	store := newTestConfigStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Active token for the target session: revoked by the call, but kept (within retention).
+	activeVal, active, err := newLLMFacadeToken("sess-x", "m", "default", llmAPIProtocolResponses, "agent", "r-active")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken: %v", err)
+	}
+	if err := store.SaveLLMFacadeToken(ctx, active); err != nil {
+		t.Fatalf("save active: %v", err)
+	}
+	// Token revoked long ago: should be pruned.
+	oldVal, old, err := newLLMFacadeToken("sess-y", "m", "default", llmAPIProtocolResponses, "agent", "r-old")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken: %v", err)
+	}
+	old.RevokedAt = now.Add(-2 * llmFacadeTokenRetention)
+	if err := store.SaveLLMFacadeToken(ctx, old); err != nil {
+		t.Fatalf("save old: %v", err)
+	}
+	// Expired token: should be pruned.
+	expVal, exp, err := newLLMFacadeToken("sess-z", "m", "default", llmAPIProtocolResponses, "agent", "r-exp")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken: %v", err)
+	}
+	exp.ExpiresAt = now.Add(-time.Minute)
+	if err := store.SaveLLMFacadeToken(ctx, exp); err != nil {
+		t.Fatalf("save expired: %v", err)
+	}
+
+	if err := store.RevokeLLMFacadeTokensForSession(ctx, "sess-x"); err != nil {
+		t.Fatalf("RevokeLLMFacadeTokensForSession: %v", err)
+	}
+
+	got, err := store.GetLLMFacadeToken(ctx, activeVal)
+	if err != nil {
+		t.Fatalf("active token should remain: %v", err)
+	}
+	if got.RevokedAt.IsZero() {
+		t.Fatalf("active token should be marked revoked")
+	}
+	if _, err := store.GetLLMFacadeToken(ctx, oldVal); err == nil {
+		t.Fatalf("long-revoked token should be pruned")
+	}
+	if _, err := store.GetLLMFacadeToken(ctx, expVal); err == nil {
+		t.Fatalf("expired token should be pruned")
+	}
+}
+
+func TestDeleteLLMFacadeToken(t *testing.T) {
+	store := newTestConfigStore(t)
+	ctx := context.Background()
+	val, token, err := newLLMFacadeToken("sess", "m", "default", llmAPIProtocolResponses, "agent", "run-1")
+	if err != nil {
+		t.Fatalf("newLLMFacadeToken: %v", err)
+	}
+	if err := store.SaveLLMFacadeToken(ctx, token); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if _, err := store.GetLLMFacadeToken(ctx, val); err != nil {
+		t.Fatalf("token should exist before delete: %v", err)
+	}
+	if err := store.DeleteLLMFacadeToken(ctx, val); err != nil {
+		t.Fatalf("DeleteLLMFacadeToken: %v", err)
+	}
+	if _, err := store.GetLLMFacadeToken(ctx, val); err == nil {
+		t.Fatalf("token should be gone after delete")
+	}
+	if err := store.DeleteLLMFacadeToken(ctx, ""); err != nil {
+		t.Fatalf("deleting empty token should be a no-op: %v", err)
+	}
+}
+
+func TestResolveRuntimeLLMTargetByExistingProviderID(t *testing.T) {
+	// No LLM env present; resolution must rely purely on the existing provider.
+	for _, k := range []string{"LLM_API_KEY", "OPENAI_API_KEY", "LLM_API_ENDPOINT", "LLM_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_ENDPOINT", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "CLAUDE_MODEL"} {
+		t.Setenv(k, "")
+	}
+	store := newTestConfigStore(t)
+	ctx := context.Background()
+	if err := store.UpsertDefaultLLMConfig(ctx, LLMProvider{
+		ID: "p1", Name: "p1", ProviderType: llmProviderFamilyOpenAI, DefaultWireAPI: llmAPIProtocolResponses,
+		BaseURL: "https://api.example.com", APIKey: "k", AuthHeader: "Authorization", AuthScheme: "Bearer",
+		Weight: 10, Enabled: true, Scope: llmProviderScopeSystem,
+	}, LLMModel{ID: "m1", Name: "m1", Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+		t.Fatalf("UpsertDefaultLLMConfig: %v", err)
+	}
+
+	target, err := resolveRuntimeLLMTarget(ctx, &appconfig.Config{}, store, "m1", "p1")
+	if err != nil {
+		t.Fatalf("resolveRuntimeLLMTarget: %v", err)
+	}
+	if target.Provider.ID != "p1" || target.Model.ID != "m1" {
+		t.Fatalf("resolved %q/%q, want p1/m1", target.Provider.ID, target.Model.ID)
+	}
+	// The existing provider must satisfy resolution without fabricating bootstrap providers.
+	providers, err := store.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("expected exactly 1 provider, got %d: %+v", len(providers), providers)
+	}
+}
+
+// TestE2ERuntimeLLMFacadeRoundTrips drives the full daemon-side facade across
+// every inbound protocol, the cross-family bridge, SSE streaming, and the main
+// rejection paths. Named with the E2E convention so the coverage gate's e2e
+// shape exercises the facade HTTP handlers and provider/token resolution.
+func TestE2ERuntimeLLMFacadeRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	service, _, _ := newTestServiceAPIHarness(t)
+
+	app := echo.New()
+	registerRuntimeLLMFacadeRoutes(app, service)
+
+	upsertProvider := func(t *testing.T, id, family, wireAPI, baseURL, authHeader, authScheme, model string) {
+		t.Helper()
+		if err := service.configDB.UpsertDefaultLLMConfig(ctx, LLMProvider{
+			ID: id, Name: id, ProviderType: family, DefaultWireAPI: wireAPI,
+			BaseURL: baseURL, APIKey: "provider-key", AuthHeader: authHeader, AuthScheme: authScheme,
+			HeadersJSON: `{"anthropic-version":"2023-06-01"}`, Weight: 10, Enabled: true, Scope: llmProviderScopeSystem,
+		}, LLMModel{ID: model, Name: model, Enabled: true, Scope: llmProviderScopeSystem}); err != nil {
+			t.Fatalf("UpsertDefaultLLMConfig(%s): %v", id, err)
+		}
+	}
+	mintToken := func(t *testing.T, session *Session, model, providerID, wireAPI string) string {
+		t.Helper()
+		val, token, err := newLLMFacadeToken(session.Summary.ID, model, providerID, wireAPI, "test", "run-e2e")
+		if err != nil {
+			t.Fatalf("newLLMFacadeToken: %v", err)
+		}
+		token.ExpiresAt = time.Now().Add(time.Hour)
+		if err := service.configDB.SaveLLMFacadeToken(ctx, token); err != nil {
+			t.Fatalf("SaveLLMFacadeToken: %v", err)
+		}
+		return val
+	}
+	post := func(sessionID, path, token, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/runtime/sessions/"+sessionID+path, bytes.NewBufferString(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		app.ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("openai_responses", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer provider-key" {
+				t.Errorf("upstream auth = %q", r.Header.Get("Authorization"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-e2e","model":"m-resp","status":"completed","output_text":"ok"}`))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-openai-resp", llmProviderFamilyOpenAI, llmAPIProtocolResponses, upstream.URL, "Authorization", "Bearer", "m-resp")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-openai-resp")
+		token := mintToken(t, session, "m-resp", "e2e-openai-resp", llmAPIProtocolResponses)
+		rec := post(session.Summary.ID, "/llm/openai/v1/responses", token, `{"model":"m-resp","input":"hi"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("openai_chat_completions", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chat-e2e","object":"chat.completion","model":"m-chat","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-openai-chat", llmProviderFamilyOpenAI, llmAPIProtocolChatCompletions, upstream.URL, "Authorization", "Bearer", "m-chat")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-openai-chat")
+		token := mintToken(t, session, "m-chat", "e2e-openai-chat", llmAPIProtocolChatCompletions)
+		rec := post(session.Summary.ID, "/llm/openai/v1/chat/completions", token, `{"model":"m-chat","messages":[{"role":"user","content":"hi"}]}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("anthropic_messages", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("x-api-key") != "provider-key" {
+				t.Errorf("upstream x-api-key = %q", r.Header.Get("x-api-key"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg-e2e","type":"message","role":"assistant","model":"m-claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-anthropic", llmProviderFamilyAnthropic, llmAPIProtocolMessages, upstream.URL, "x-api-key", "", "m-claude")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-anthropic")
+		token := mintToken(t, session, "m-claude", "e2e-anthropic", llmAPIProtocolMessages)
+		rec := post(session.Summary.ID, "/llm/anthropic/v1/messages", token, `{"model":"m-claude","messages":[{"role":"user","content":"hi"}]}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("cross_family_openai_to_anthropic", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg-bridge","type":"message","role":"assistant","model":"m-bridge","content":[{"type":"text","text":"bridged"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-bridge", llmProviderFamilyAnthropic, llmAPIProtocolMessages, upstream.URL, "x-api-key", "", "m-bridge")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-bridge")
+		token := mintToken(t, session, "m-bridge", "e2e-bridge", llmAPIProtocolResponses)
+		rec := post(session.Summary.ID, "/llm/openai/v1/responses", token, `{"model":"m-bridge","input":"hi"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("sse_stream", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: message\ndata: hello\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("event: done\ndata: [DONE]\n\n"))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-sse", llmProviderFamilyOpenAI, llmAPIProtocolResponses, upstream.URL, "Authorization", "Bearer", "m-sse")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-sse")
+		token := mintToken(t, session, "m-sse", "e2e-sse", llmAPIProtocolResponses)
+		rec := post(session.Summary.ID, "/llm/openai/v1/responses", token, `{"model":"m-sse","input":"hi","stream":true}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "data:") {
+			t.Fatalf("expected SSE data in response, got %q", rec.Body.String())
+		}
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"x","model":"m-rej","status":"completed","output_text":"ok"}`))
+		}))
+		t.Cleanup(upstream.Close)
+		service.llm.client = upstream.Client()
+		upsertProvider(t, "e2e-rej", llmProviderFamilyOpenAI, llmAPIProtocolResponses, upstream.URL, "Authorization", "Bearer", "m-rej")
+		session := createRunningLLMFacadeSession(t, ctx, service, "e2e-rej")
+		token := mintToken(t, session, "m-rej", "e2e-rej", llmAPIProtocolResponses)
+		path := "/llm/openai/v1/responses"
+
+		if rec := post(session.Summary.ID, path, "", `{"model":"m-rej","input":"hi"}`); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("missing token: status=%d", rec.Code)
+		}
+		if rec := post(session.Summary.ID, path, "ac_llm_bogus", `{"model":"m-rej","input":"hi"}`); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("bad token: status=%d", rec.Code)
+		}
+		if rec := post("other-session", path, token, `{"model":"m-rej","input":"hi"}`); rec.Code != http.StatusForbidden {
+			t.Fatalf("wrong session: status=%d", rec.Code)
+		}
+		if rec := post(session.Summary.ID, path, token, `{"model":"mismatch","input":"hi"}`); rec.Code != http.StatusForbidden {
+			t.Fatalf("model mismatch: status=%d", rec.Code)
+		}
+	})
+}
+
+// A session-only Anthropic key with no model anywhere must fail fast at config
+// time: request-time resolution runs without session env, so the key can never
+// resolve a provider. The facade must not inject an unbound token that defers
+// the failure to every runtime request.
+func TestEnsureSessionClaudeFacadeFailsFastWhenSessionKeyHasNoModel(t *testing.T) {
+	ctx := context.Background()
+	for _, k := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "CLAUDE_MODEL", "LLM_API_KEY", "LLM_API_ENDPOINT", "LLM_MODEL", "OPENAI_API_KEY"} {
+		t.Setenv(k, "")
+	}
+	service, _, _ := newTestServiceAPIHarness(t)
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+	service.config.LLMAPIEndpoint = ""
+	service.config.LLMAPIKey = ""
+	service.config.LLMModel = ""
+
+	session := createRunningLLMFacadeSession(t, ctx, service, "session-claude-key-no-model")
+	session.ProviderEnvItems = []SessionEnvVar{
+		{Name: "ANTHROPIC_API_KEY", Value: "session-only-key", Secret: true},
+	}
+
+	env, err := ensureSessionLLMFacadeConfig(ctx, service.config, service.configDB, session, "claude", "", "test", "run-1")
+	if err == nil {
+		t.Fatalf("expected fail-fast error, got env=%#v", env)
+	}
+	if env != nil {
+		t.Fatalf("expected no facade env on failure, got %#v", env)
+	}
+	if !strings.Contains(err.Error(), "model") {
+		t.Fatalf("error = %v, want it to mention the missing model", err)
+	}
+	providers, perr := service.configDB.ListEnabledLLMProviders(ctx)
+	if perr != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", perr)
+	}
+	if len(providers) != 0 {
+		t.Fatalf("no provider should be created, got %#v", providers)
+	}
+}
+
+// A session whose LLM key came only from per-session env must keep working after
+// a stop/resume. The raw key env (ProviderEnvItems) is not persisted, so on
+// resume resolution sees only the key-filtered env; it must reuse the
+// session-env provider persisted at creation (with its key intact) rather than
+// skip it or overwrite its key with the now-empty env.
+func TestResolveRuntimeLLMTargetReusesSessionProviderAfterResume(t *testing.T) {
+	ctx := context.Background()
+	for _, k := range []string{"LLM_API_KEY", "OPENAI_API_KEY", "LLM_API_ENDPOINT", "LLM_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "CLAUDE_MODEL"} {
+		t.Setenv(k, "")
+	}
+	store := newTestConfigStore(t)
+	cfg := &appconfig.Config{}
+	sessionID := "sess-resume"
+
+	// Creation: full env with the session-scoped key (mirrors ProviderEnvItems).
+	creationEnv := []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-llm.example.invalid"},
+		{Name: "LLM_API_KEY", Value: "session-real-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "m-resume"},
+	}
+	target, err := resolveRuntimeLLMTargetWithEnv(ctx, cfg, store, sessionID, llmProviderFamilyOpenAI, "", "", creationEnv)
+	if err != nil {
+		t.Fatalf("creation resolve: %v", err)
+	}
+	wantID := sessionEnvProviderID(sessionID, llmProviderFamilyOpenAI)
+	if target.Provider.ID != wantID || target.Provider.APIKey != "session-real-key" {
+		t.Fatalf("creation target = %q/%q, want %q/session-real-key", target.Provider.ID, target.Provider.APIKey, wantID)
+	}
+
+	// Resume: key-filtered env (filterPersistedRuntimeEnv stripped LLM_API_KEY).
+	resumeEnv := []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-llm.example.invalid"},
+		{Name: "LLM_MODEL", Value: "m-resume"},
+	}
+	resumed, err := resolveRuntimeLLMTargetWithEnv(ctx, cfg, store, sessionID, llmProviderFamilyOpenAI, "", "", resumeEnv)
+	if err != nil {
+		t.Fatalf("resume resolve: %v", err)
+	}
+	if resumed.Provider.ID != wantID {
+		t.Fatalf("resume provider = %q, want persisted session provider %q", resumed.Provider.ID, wantID)
+	}
+	if resumed.Provider.APIKey != "session-real-key" {
+		t.Fatalf("resume provider key = %q, want preserved session-real-key (not clobbered)", resumed.Provider.APIKey)
+	}
+	if resumed.Headers.Get("Authorization") != "Bearer session-real-key" {
+		t.Fatalf("resume auth header = %q, want Bearer session-real-key", resumed.Headers.Get("Authorization"))
+	}
+
+	// Rotation: a resume-time env that *does* carry a new key must update it,
+	// not get pinned to the stale persisted key.
+	rotatedEnv := []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-llm.example.invalid"},
+		{Name: "LLM_API_KEY", Value: "rotated-key", Secret: true},
+		{Name: "LLM_MODEL", Value: "m-resume"},
+	}
+	rotated, err := resolveRuntimeLLMTargetWithEnv(ctx, cfg, store, sessionID, llmProviderFamilyOpenAI, "", "", rotatedEnv)
+	if err != nil {
+		t.Fatalf("rotation resolve: %v", err)
+	}
+	if rotated.Provider.APIKey != "rotated-key" {
+		t.Fatalf("rotation provider key = %q, want rotated-key", rotated.Provider.APIKey)
+	}
+}

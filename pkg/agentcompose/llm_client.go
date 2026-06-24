@@ -32,6 +32,7 @@ type LLMGenerateResult struct {
 const (
 	llmAPIProtocolResponses       = "responses"
 	llmAPIProtocolChatCompletions = "chat_completions"
+	llmAPIProtocolMessages        = "messages"
 )
 
 type llmAPIRequest struct {
@@ -129,17 +130,21 @@ func (c *LLMClient) Generate(ctx context.Context, prompt, model, outputSchemaJSO
 	if prompt == "" {
 		return LLMGenerateResult{}, fmt.Errorf("prompt is required")
 	}
-	protocol := c.resolveProtocol(ctx)
-	endpoint := strings.TrimSpace(c.resolveEndpointForProtocol(ctx, protocol))
+	target, err := resolveLLMTarget(ctx, c.config, c.configDB, model)
+	if err != nil {
+		return LLMGenerateResult{}, err
+	}
+	protocol := normalizeLLMWireAPI(target.WireAPI)
+	endpoint := strings.TrimSpace(target.Endpoint)
 	if endpoint == "" {
 		return LLMGenerateResult{}, fmt.Errorf("llm api endpoint is not configured")
 	}
-	model = strings.TrimSpace(firstNonEmpty(model, c.resolveSetting(ctx, c.config.LLMModel, "LLM_MODEL")))
+	model = strings.TrimSpace(firstNonEmpty(model, target.Model.Name, target.Model.ID))
 	if model == "" {
 		return LLMGenerateResult{}, fmt.Errorf("llm model is required")
 	}
 	if protocol == llmAPIProtocolChatCompletions {
-		return c.generateChatCompletions(ctx, endpoint, prompt, model, outputSchemaJSON)
+		return c.generateChatCompletions(ctx, endpoint, prompt, model, outputSchemaJSON, target.Headers)
 	}
 	if protocol != llmAPIProtocolResponses {
 		return LLMGenerateResult{}, fmt.Errorf("unsupported llm api protocol %q", protocol)
@@ -166,10 +171,7 @@ func (c *LLMClient) Generate(ctx context.Context, prompt, model, outputSchemaJSO
 	if err != nil {
 		return LLMGenerateResult{}, fmt.Errorf("create llm request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if apiKey := strings.TrimSpace(c.resolveAPIKey(ctx, "LLM_API_KEY", "OPENAI_API_KEY")); apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
+	applyLLMForwardHeaders(req.Header, target.Headers)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return LLMGenerateResult{}, fmt.Errorf("call llm endpoint: %w", err)
@@ -208,7 +210,7 @@ func (c *LLMClient) Generate(ctx context.Context, prompt, model, outputSchemaJSO
 
 // generateChatCompletions calls an OpenAI-compatible Chat Completions backend for
 // unary prompt-to-response text generation (LLMService, scheduler.llm).
-func (c *LLMClient) generateChatCompletions(ctx context.Context, endpoint, prompt, model, outputSchemaJSON string) (LLMGenerateResult, error) {
+func (c *LLMClient) generateChatCompletions(ctx context.Context, endpoint, prompt, model, outputSchemaJSON string, headers http.Header) (LLMGenerateResult, error) {
 	messages := []llmChatCompletionsMessage{{Role: "user", Content: prompt}}
 	request := llmChatCompletionsRequest{Model: model, Messages: messages}
 	if schema := strings.TrimSpace(outputSchemaJSON); schema != "" {
@@ -229,10 +231,7 @@ func (c *LLMClient) generateChatCompletions(ctx context.Context, endpoint, promp
 	if err != nil {
 		return LLMGenerateResult{}, fmt.Errorf("create llm chat completions request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if apiKey := strings.TrimSpace(c.resolveAPIKey(ctx, "LLM_API_KEY", "OPENAI_API_KEY")); apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
+	applyLLMForwardHeaders(req.Header, headers)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return LLMGenerateResult{}, fmt.Errorf("call llm chat completions endpoint: %w", err)
@@ -272,6 +271,15 @@ func (c *LLMClient) generateChatCompletions(ctx context.Context, endpoint, promp
 	}, nil
 }
 
+func applyLLMForwardHeaders(dst http.Header, src http.Header) {
+	dst.Set("Content-Type", "application/json")
+	for key, values := range src {
+		for _, value := range values {
+			dst.Set(key, value)
+		}
+	}
+}
+
 func (c *LLMClient) resolveSetting(ctx context.Context, fallback string, keys ...string) string {
 	if value := strings.TrimSpace(c.lookupGlobalEnv(ctx, keys...)); value != "" {
 		return value
@@ -283,21 +291,6 @@ func (c *LLMClient) resolveSetting(ctx context.Context, fallback string, keys ..
 	}
 	if value := strings.TrimSpace(fallback); value != "" {
 		return value
-	}
-	return ""
-}
-
-func (c *LLMClient) resolveAPIKey(ctx context.Context, keys ...string) string {
-	if value := strings.TrimSpace(c.lookupGlobalEnv(ctx, keys...)); value != "" {
-		return value
-	}
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(strings.TrimSpace(key))); value != "" {
-			return value
-		}
-	}
-	if c != nil && c.config != nil {
-		return strings.TrimSpace(c.config.LLMAPIKey)
 	}
 	return ""
 }

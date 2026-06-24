@@ -58,6 +58,9 @@ func (s *ConfigStore) initSchema(ctx context.Context) error {
 	if err := s.ensureGlobalEnvSchema(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureLLMSchema(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureCapabilityGatewaySchema(ctx); err != nil {
 		return err
 	}

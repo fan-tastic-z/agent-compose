@@ -246,10 +246,18 @@ Important variables include:
 - `HTTP_BASIC_AUTH`: base64-encoded `username:password` for additional HTTP
   Basic authentication.
 - `LLM_API_ENDPOINT`, `LLM_API_PROTOCOL`, `LLM_API_KEY`, `OPENAI_API_KEY`,
-  `LLM_MODEL`, `LLM_TIMEOUT`: LLM client settings for the daemon `LLMService`
-  only. These do not inject API keys into guest agent runtimes. Set
+  `LLM_MODEL`, `LLM_TIMEOUT`: daemon-side OpenAI-family LLM settings for
+  `LLMService`, `scheduler.llm`, and runtime agent LLM facade bootstrap. These
+  values are not injected as provider keys into guest agent runtimes. Set
   `LLM_API_PROTOCOL=chat_completions` for OpenAI-compatible chat completions
   backends (aliases: `chat`, `chat_completion`).
+- `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_ENDPOINT`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`: daemon-side
+  Anthropic-family LLM facade bootstrap settings.
+- `AGENT_COMPOSE_RUNTIME_BASE_URL`: optional guest-reachable daemon base URL
+  used when generating runtime LLM facade configuration. Docker Compose
+  defaults this to `http://agent-compose:7410`; host-based Docker setups should
+  set it to a concrete host IP/name and port.
 - `CAP_GRPC_LISTEN`, `CAP_GRPC_TARGET`: required only when agents need to call
   OctoBus gRPC capabilities. `CAP_GRPC_LISTEN` starts the agent-compose
   capability proxy; `CAP_GRPC_TARGET` is the guest-reachable address injected
@@ -274,15 +282,20 @@ Important variables include:
 ### Agent providers
 
 Guest agent sessions run provider CLIs inside the guest container
-(`agent-compose-runtime-js`). API keys for Codex, Claude, and Gemini must be
-supplied as session or global environment variables (for example through the UI:
-Settings -> Global environment variables), not only in the daemon `.env`.
+(`agent-compose-runtime-js`). Codex and Claude calls use the Runtime LLM Facade:
+provider keys stay in the daemon-side LLM provider configuration, while guest
+runtimes receive session-scoped facade tokens and facade base URLs. LLM provider
+key names such as `LLM_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `GOOGLE_API_KEY`, and `GEMINI_API_KEY` are filtered from
+user-supplied runtime environment variables. Compatibility aliases such as
+`LLM_API_KEY` and `LLM_API_ENDPOINT` may still appear in the runtime, but they
+are daemon-managed facade values, not upstream provider credentials.
 
 | Provider | Typical env vars | Notes |
 | --- | --- | --- |
-| `codex` | `OPENAI_API_KEY` or provider-specific keys in `assets/.codex/config.toml` | Uses Codex CLI/SDK in the guest image |
-| `claude` | `ANTHROPIC_API_KEY` | Uses Claude Code CLI in the guest image |
-| `gemini` | `GEMINI_API_KEY` | Uses Gemini CLI in the guest image |
+| `codex` | daemon LLM provider config; runtime receives `AGENT_COMPOSE_SESSION_TOKEN`, `LLM_API_KEY`, `LLM_API_ENDPOINT`, `OPENAI_BASE_URL`, and facade-token API key aliases | Uses Codex CLI/SDK in the guest image |
+| `claude` | daemon Anthropic-family provider config; runtime receives `AGENT_COMPOSE_SESSION_TOKEN`, `LLM_API_KEY`, `LLM_API_ENDPOINT`, `ANTHROPIC_BASE_URL`, and facade-token API key aliases | Uses Claude Code CLI in the guest image |
+| `gemini` | not yet routed through the LLM facade | Uses Gemini CLI in the guest image |
 
 After changing guest runtime code or provider support, rebuild the guest image:
 
@@ -292,6 +305,20 @@ task image:agent-compose-guest
 
 Create a new session (or resume one) so the updated image and environment
 variables are picked up.
+
+> **Upgrade note (breaking for some Docker setups):** Because provider keys are
+> no longer passed through to guest runtimes, Codex/Claude now reach their LLM
+> upstream through the daemon facade and need a guest-reachable daemon URL. The
+> bundled `docker-compose.yml` / `docker-compose.deploy.yml` set
+> `AGENT_COMPOSE_RUNTIME_BASE_URL=http://agent-compose:7410` for you. If you run
+> the daemon directly on a host with the Docker driver and an
+> `HTTP_LISTEN=127.0.0.1:...` bind, the container cannot reach that loopback
+> address, so facade config is skipped and agent runs will have no working LLM
+> credentials. Set `AGENT_COMPOSE_RUNTIME_BASE_URL` to a concrete
+> host-reachable IP/name and port (for example `http://host.docker.internal:7410`).
+
+The Runtime LLM Facade design is documented in
+[`docs/zh-CN/design/agent-compose-runtime-llm-facade.md`](docs/zh-CN/design/agent-compose-runtime-llm-facade.md).
 
 ### Chat Completions LLM Protocol
 

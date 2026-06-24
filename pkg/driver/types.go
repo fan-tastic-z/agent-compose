@@ -24,8 +24,9 @@ type SessionSummary struct {
 }
 
 type Session struct {
-	Summary  SessionSummary  `json:"summary"`
-	EnvItems []SessionEnvVar `json:"env_items,omitempty"`
+	Summary         SessionSummary  `json:"summary"`
+	EnvItems        []SessionEnvVar `json:"env_items,omitempty"`
+	RuntimeEnvItems []SessionEnvVar `json:"-"`
 }
 
 type VMState struct {
@@ -86,22 +87,36 @@ type BoxRuntime interface {
 	ExecStream(context.Context, *Session, VMState, ExecSpec, ExecStreamWriter) (ExecResult, error)
 }
 
-func sessionEnvMap(items []SessionEnvVar) map[string]string {
-	if len(items) == 0 {
+func sessionEnvMap(groups ...[]SessionEnvVar) map[string]string {
+	if len(groups) == 0 {
 		return nil
 	}
-	env := make(map[string]string, len(items))
-	for _, item := range items {
-		name := strings.TrimSpace(item.Name)
-		if name == "" {
-			continue
+	env := make(map[string]string)
+	for groupIndex, items := range groups {
+		for _, item := range items {
+			name := strings.TrimSpace(item.Name)
+			if name == "" || (groupIndex == 0 && LLMProviderKeyName(name)) {
+				continue
+			}
+			env[name] = item.Value
 		}
-		env[name] = item.Value
 	}
 	if len(env) == 0 {
 		return nil
 	}
 	return env
+}
+
+// LLMProviderKeyName reports whether name is a long-lived LLM provider credential
+// that must never be passed through to a guest runtime. It is the canonical
+// denylist shared by the driver env assembly and the agent-compose facade layer.
+func LLMProviderKeyName(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY", "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY":
+		return true
+	default:
+		return false
+	}
 }
 
 func firstNonEmpty(values ...string) string {

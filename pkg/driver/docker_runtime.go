@@ -538,7 +538,7 @@ func (r *dockerRuntime) containerName(session *Session, vmState VMState) string 
 
 func (r *dockerRuntime) containerEnv(session *Session, proxyState ProxyState) []string {
 	appconfig.ApplyDefaultGuestPaths(r.config)
-	env := sessionEnvMap(session.EnvItems)
+	env := sessionEnvMap(session.EnvItems, session.RuntimeEnvItems)
 	if env == nil {
 		env = map[string]string{}
 	}

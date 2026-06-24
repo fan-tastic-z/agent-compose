@@ -132,6 +132,10 @@ func toDriverSession(session *Session) *driverpkg.Session {
 	for _, item := range session.EnvItems {
 		envItems = append(envItems, driverpkg.SessionEnvVar{Name: item.Name, Value: item.Value, Secret: item.Secret})
 	}
+	runtimeEnvItems := make([]driverpkg.SessionEnvVar, 0, len(session.RuntimeEnvItems))
+	for _, item := range session.RuntimeEnvItems {
+		runtimeEnvItems = append(runtimeEnvItems, driverpkg.SessionEnvVar{Name: item.Name, Value: item.Value, Secret: item.Secret})
+	}
 	return &driverpkg.Session{
 		Summary: driverpkg.SessionSummary{
 			ID:            session.Summary.ID,
@@ -142,7 +146,8 @@ func toDriverSession(session *Session) *driverpkg.Session {
 			CreatedAt:     session.Summary.CreatedAt,
 			UpdatedAt:     session.Summary.UpdatedAt,
 		},
-		EnvItems: envItems,
+		EnvItems:        envItems,
+		RuntimeEnvItems: runtimeEnvItems,
 	}
 }
 

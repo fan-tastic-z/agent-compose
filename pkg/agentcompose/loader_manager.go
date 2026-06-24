@@ -848,6 +848,7 @@ func (h *loaderRunHost) Agent(ctx context.Context, prompt string, request Loader
 
 	agent := normalizeAgentKind(request.Agent)
 	var agentDefinitionID string
+	model := ""
 	if agent == "" {
 		agentDefinition, err := h.manager.loaderAgentDefinition(ctx, h.loader)
 		if err != nil {
@@ -856,6 +857,7 @@ func (h *loaderRunHost) Agent(ctx context.Context, prompt string, request Loader
 		if agentDefinition != nil {
 			agent = normalizeAgentKind(agentDefinition.Provider)
 			agentDefinitionID = strings.TrimSpace(agentDefinition.ID)
+			model = agentDefinition.Model
 		}
 	}
 	if agentDefinitionID == "" {
@@ -871,6 +873,8 @@ func (h *loaderRunHost) Agent(ctx context.Context, prompt string, request Loader
 	cell, _, _, execErr := h.manager.executor.ExecuteAgentRequest(ctx, session, ExecuteAgentRequest{
 		Agent:             agent,
 		AgentDefinitionID: agentDefinitionID,
+		Model:             model,
+		RunID:             h.run.ID,
 		Message:           prompt,
 		Timeout:           request.Timeout,
 		OutputSchemaJSON:  request.OutputSchema,
@@ -1195,6 +1199,8 @@ func (m *LoaderManager) ensureLoaderSessionWithOptions(ctx context.Context, load
 	}
 	envItems = mergeEnvItems(envItems, loader.EnvItems)
 	envItems = mergeEnvItems(envItems, request.SessionEnv)
+	providerEnvItems := envItems
+	envItems = filterPersistedRuntimeEnv(envItems)
 	capabilityVars, capabilityTags := buildCapabilityGatewaySessionVars(capabilityGatewayProxyTarget(m.cap), loader.Summary.CapsetIDs)
 	envItems = mergeEnvItems(envItems, capabilityVars)
 	tags := []SessionTag{{Name: "origin", Value: "loader"}, {Name: "loader_id", Value: loader.Summary.ID}, {Name: "loader_name", Value: loader.Summary.Name}}
@@ -1244,6 +1250,7 @@ func (m *LoaderManager) ensureLoaderSessionWithOptions(ctx context.Context, load
 	if err != nil {
 		return nil, "", err
 	}
+	session.ProviderEnvItems = providerEnvItems
 	if err := prepareSessionWorkspace(ctx, m.config, m.configDB, session); err != nil {
 		session.Summary.VMStatus = VMStatusFailed
 		_ = m.store.UpdateSession(ctx, session)
@@ -1270,6 +1277,7 @@ func (m *LoaderManager) ensureLoaderSessionWithOptions(ctx context.Context, load
 	if err != nil {
 		return nil, "", err
 	}
+	restoreSessionTransientFields(loaded, session)
 	m.Publish("agent-compose.session.created", map[string]any{
 		"sessionId":     loaded.Summary.ID,
 		"title":         loaded.Summary.Title,
@@ -1345,6 +1353,7 @@ func (m *LoaderManager) loadOrResumeLoaderSession(ctx context.Context, sessionID
 	if err != nil {
 		return nil, "", err
 	}
+	restoreSessionTransientFields(loaded, session)
 	m.Publish("agent-compose.session.resumed", map[string]any{
 		"sessionId": loaded.Summary.ID,
 		"title":     loaded.Summary.Title,

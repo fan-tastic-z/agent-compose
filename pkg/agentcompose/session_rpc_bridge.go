@@ -179,6 +179,8 @@ func (b *SessionRPCBridge) createSession(ctx context.Context, req *connect.Reque
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	envItems = mergeEnvItems(globalEnvItems, envItems)
+	providerEnvItems := envItems
+	envItems = filterPersistedRuntimeEnv(envItems)
 	capabilityVars, capabilityTags := buildCapabilityGatewaySessionVars(capabilityGatewayProxyTarget(b.cap), req.Msg.GetCapsetIds())
 	envItems = mergeEnvItems(envItems, capabilityVars)
 	tags = append(tags, capabilityTags...)
@@ -202,6 +204,7 @@ func (b *SessionRPCBridge) createSession(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	session.ProviderEnvItems = providerEnvItems
 	if err := prepareSessionWorkspace(ctx, b.config, b.configDB, session); err != nil {
 		session.Summary.VMStatus = VMStatusFailed
 		_ = b.store.UpdateSession(ctx, session)
@@ -232,6 +235,7 @@ func (b *SessionRPCBridge) createSession(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	restoreSessionTransientFields(loaded, session)
 	b.publishLoaderTopic("agent-compose.session.created", sessionTopicPayload(loaded, source))
 	return connect.NewResponse(&agentcomposev1.SessionResponse{Session: toProtoSessionDetail(loaded)}), nil
 }
@@ -265,6 +269,7 @@ func (b *SessionRPCBridge) resumeSession(ctx context.Context, req *connect.Reque
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	restoreSessionTransientFields(loaded, session)
 	b.publishLoaderTopic("agent-compose.session.resumed", sessionTopicPayload(loaded, source))
 	return connect.NewResponse(&agentcomposev1.SessionResponse{Session: toProtoSessionDetail(loaded)}), nil
 }
@@ -316,6 +321,9 @@ func (b *SessionRPCBridge) reconcileSessionRuntimeState(ctx context.Context, ses
 	session.Summary.VMStatus = VMStatusStopped
 	if err := b.store.UpdateSession(ctx, session); err != nil {
 		return nil, err
+	}
+	if b.configDB != nil {
+		_ = b.configDB.RevokeLLMFacadeTokensForSession(ctx, session.Summary.ID)
 	}
 	b.streams.PublishSessionUpdated(&session.Summary)
 	b.notifyDashboard("session_updated")

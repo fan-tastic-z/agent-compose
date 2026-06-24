@@ -342,6 +342,61 @@ func TestRunAgentStreamSendFailurePersistsTerminalRun(t *testing.T) {
 	}
 }
 
+func TestRunAgentSessionEnvProviderUsesAgentDefinitionModelAfterSessionReload(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+	spec := newProjectServiceTestSpec("session-provider-env", "session-agent-model")
+	spec.Variables = []*agentcomposev2.EnvVarSpec{
+		{Name: "LLM_API_ENDPOINT", Value: "https://session-openai.example.invalid/v1"},
+		{Name: "LLM_API_KEY", Value: "session-provider-key", Secret: true},
+	}
+	store, service, projectID := setupRunPreparationProject(t, spec, t.TempDir())
+	service.config.RuntimeBaseURL = "http://agent-compose.test"
+
+	resp, err := service.RunAgent(ctx, connect.NewRequest(&agentcomposev2.RunAgentRequest{
+		ProjectId:       projectID,
+		AgentName:       "reviewer",
+		Prompt:          "use session provider env",
+		ClientRequestId: "session-provider-env-request",
+	}))
+	if err != nil {
+		t.Fatalf("RunAgent returned error: %v", err)
+	}
+	summary := resp.Msg.GetRun().GetSummary()
+	if summary.GetStatus() != agentcomposev2.RunStatus_RUN_STATUS_SUCCEEDED || summary.GetSessionId() == "" {
+		t.Fatalf("RunAgent summary = %#v", summary)
+	}
+	providers, err := store.ListEnabledLLMProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMProviders returned error: %v", err)
+	}
+	if len(providers) != 1 {
+		t.Fatalf("provider count = %d, want 1: %#v", len(providers), providers)
+	}
+	if providers[0].APIKey != "session-provider-key" || providers[0].BaseURL != "https://session-openai.example.invalid/v1" || providers[0].Scope != llmProviderScopeSessionEnv {
+		t.Fatalf("provider was not bootstrapped from session env: %#v", providers[0])
+	}
+	models, err := store.ListEnabledLLMModels(ctx)
+	if err != nil {
+		t.Fatalf("ListEnabledLLMModels returned error: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "session-agent-model" {
+		t.Fatalf("models = %#v, want session-agent-model", models)
+	}
+	session, err := service.store.GetSession(ctx, summary.GetSessionId())
+	if err != nil {
+		t.Fatalf("GetSession returned error: %v", err)
+	}
+	for _, item := range session.EnvItems {
+		if llmProviderKeyName(item.Name) || strings.Contains(item.Value, "session-provider-key") {
+			t.Fatalf("provider key leaked into persisted session env: %#v", session.EnvItems)
+		}
+	}
+}
+
 func TestIntegrationRunAgentCleanupFailureRecordsRunCleanupError(t *testing.T) {
 	testRunAgentCleanupFailureRecordsRunCleanupError(t)
 }

@@ -15,6 +15,7 @@ services:
       SESSION_ROOT: /data/sessions
       DOCKER_HOST_SESSION_ROOT: ${DOCKER_HOST_SESSION_ROOT:-$PWD/data/agent-compose/sessions}
       HTTP_LISTEN: 0.0.0.0:7410
+      AGENT_COMPOSE_RUNTIME_BASE_URL: ${AGENT_COMPOSE_RUNTIME_BASE_URL:-http://agent-compose:7410}
       RUNTIME_DRIVER: docker
       DEFAULT_IMAGE: ${DEFAULT_IMAGE:-debian:bookworm-slim}
       GUEST_WORKSPACE: /workspace

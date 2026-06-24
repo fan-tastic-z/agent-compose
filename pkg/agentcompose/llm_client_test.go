@@ -66,6 +66,90 @@ func TestLLMClientGenerateHandlesSuccessAndFailures(t *testing.T) {
 	testLLMClientGenerateHandlesSuccessAndFailures(t)
 }
 
+func TestLLMClientGenerateKeepsCustomEndpointPath(t *testing.T) {
+	ctx := context.Background()
+	store := newTestConfigStore(t)
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-custom","model":"model-a","status":"completed","output_text":"ok"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := &LLMClient{
+		config: &appconfig.Config{
+			LLMAPIEndpoint: server.URL + "/custom/path",
+			LLMModel:       "model-a",
+		},
+		configDB: store,
+		client:   server.Client(),
+	}
+	if _, err := client.Generate(ctx, "prompt", "", ""); err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if gotPath != "/custom/path" {
+		t.Fatalf("request path = %q, want custom endpoint path without appended operation", gotPath)
+	}
+}
+
+func TestLLMClientGenerateRefreshesDefaultEnvProviderFromGlobalEnv(t *testing.T) {
+	ctx := context.Background()
+	store := newTestConfigStore(t)
+	t.Setenv("LLM_API_ENDPOINT", "")
+	t.Setenv("LLM_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("LLM_MODEL", "")
+
+	var firstAuth, firstBody string
+	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstAuth = r.Header.Get("Authorization")
+		firstBody = readRequestBodyForTest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"model-one","status":"completed","output_text":"one"}`))
+	}))
+	t.Cleanup(firstServer.Close)
+
+	if _, err := store.ReplaceGlobalEnv(ctx, []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: firstServer.URL, Secret: false},
+		{Name: "LLM_API_KEY", Value: "key-one", Secret: true},
+		{Name: "LLM_MODEL", Value: "model-one", Secret: false},
+	}); err != nil {
+		t.Fatalf("ReplaceGlobalEnv(first) returned error: %v", err)
+	}
+	client := &LLMClient{config: &appconfig.Config{}, configDB: store, client: firstServer.Client()}
+	if _, err := client.Generate(ctx, "prompt", "", ""); err != nil {
+		t.Fatalf("Generate(first) returned error: %v", err)
+	}
+	if firstAuth != "Bearer key-one" || !strings.Contains(firstBody, `"model":"model-one"`) {
+		t.Fatalf("first request auth/body = %q / %s, want key-one and model-one", firstAuth, firstBody)
+	}
+
+	var secondAuth, secondBody string
+	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondAuth = r.Header.Get("Authorization")
+		secondBody = readRequestBodyForTest(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-2","model":"model-two","status":"completed","output_text":"two"}`))
+	}))
+	t.Cleanup(secondServer.Close)
+
+	if _, err := store.ReplaceGlobalEnv(ctx, []SessionEnvVar{
+		{Name: "LLM_API_ENDPOINT", Value: secondServer.URL, Secret: false},
+		{Name: "LLM_API_KEY", Value: "key-two", Secret: true},
+		{Name: "LLM_MODEL", Value: "model-two", Secret: false},
+	}); err != nil {
+		t.Fatalf("ReplaceGlobalEnv(second) returned error: %v", err)
+	}
+	client.client = secondServer.Client()
+	if _, err := client.Generate(ctx, "prompt", "", ""); err != nil {
+		t.Fatalf("Generate(second) returned error: %v", err)
+	}
+	if secondAuth != "Bearer key-two" || !strings.Contains(secondBody, `"model":"model-two"`) {
+		t.Fatalf("second request auth/body = %q / %s, want key-two and model-two", secondAuth, secondBody)
+	}
+}
+
 func testLLMClientGenerateHandlesSuccessAndFailures(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
@@ -116,9 +200,12 @@ func testLLMClientGenerateHandlesSuccessAndFailures(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":{"message":"bad request"}}`))
 	}))
 	t.Cleanup(failureServer.Close)
-	client.config.LLMAPIEndpoint = failureServer.URL
-	client.client = failureServer.Client()
-	if _, err := client.Generate(ctx, "prompt", "model-a", ""); err == nil || !strings.Contains(err.Error(), "bad request") {
+	failureClient := &LLMClient{
+		config:   &appconfig.Config{LLMAPIEndpoint: failureServer.URL, LLMAPIKey: "fallback-key", LLMModel: "model-a"},
+		configDB: newTestConfigStore(t),
+		client:   failureServer.Client(),
+	}
+	if _, err := failureClient.Generate(ctx, "prompt", "model-a", ""); err == nil || !strings.Contains(err.Error(), "bad request") {
 		t.Fatalf("Generate(failure response) error = %v, want bad request", err)
 	}
 }
@@ -407,7 +494,7 @@ func TestLoaderRunHostLLMChatCompletionsProtocol(t *testing.T) {
 	}
 	host := &loaderRunHost{
 		manager: manager,
-		loader: Loader{Summary: LoaderSummary{ID: "loader-1"}},
+		loader:  Loader{Summary: LoaderSummary{ID: "loader-1"}},
 		run:     &LoaderRunSummary{ID: "run-1", LoaderID: "loader-1"},
 	}
 

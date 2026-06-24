@@ -14,9 +14,10 @@ import (
 )
 
 type ProjectRunPreparation struct {
-	EnvItems        []SessionEnvVar
-	WorkspaceConfig *WorkspaceConfig
-	Workspace       *SessionWorkspace
+	EnvItems         []SessionEnvVar
+	ProviderEnvItems []SessionEnvVar
+	WorkspaceConfig  *WorkspaceConfig
+	Workspace        *SessionWorkspace
 }
 
 func (s *Service) prepareProjectRun(ctx context.Context, run ProjectRunRecord, requestEnv []*agentcomposev2.EnvVarSpec) (ProjectRunPreparation, error) {
@@ -53,11 +54,13 @@ func (s *Service) prepareProjectRun(ctx context.Context, run ProjectRunRecord, r
 		agent.EnvItems,
 		sessionEnvItemsFromV2(requestEnv),
 	)
+	providerEnvItems := envItems
+	envItems = filterPersistedRuntimeEnv(envItems)
 	workspace, err := s.prepareProjectRunWorkspace(ctx, run, project, composeWorkspaceSpecFromV2(spec.GetWorkspace()), composeWorkspaceSpecFromV2(agentSpec.GetWorkspace()))
 	if err != nil {
 		return ProjectRunPreparation{}, err
 	}
-	prepared := ProjectRunPreparation{EnvItems: envItems}
+	prepared := ProjectRunPreparation{EnvItems: envItems, ProviderEnvItems: providerEnvItems}
 	if workspace != nil {
 		prepared.WorkspaceConfig = workspace
 		prepared.Workspace = toSessionWorkspaceSnapshot(*workspace)
