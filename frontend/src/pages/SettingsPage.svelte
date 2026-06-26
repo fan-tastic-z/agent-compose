@@ -465,7 +465,7 @@
       error = '智能体工作文件名称必填';
       return;
     }
-    // file / empty 类型不绑定客户端 JSON 配置；file 的存储根由后端按 workspace id 生成。
+    // file 类型不绑定客户端 JSON 配置；file 的存储根由后端按 workspace id 生成。
     let configJson = '{}';
     if (workspaceType === 'git') {
       configJson = workspaceConfigMode === 'json' ? workspaceConfigJson : buildWorkspaceConfigJson();
@@ -843,7 +843,7 @@
   <section class="config-card">
     <div class="panel-head"><h2>智能体工作文件</h2><button on:click={openCreateWorkspace}>新增配置</button></div>
     <div class="workspace-editor">
-      <select bind:value={workspaceType} on:change={onWorkspaceTypeChange}><option value="git">Git</option><option value="file">文件</option><option value="empty">空工作文件</option></select>
+      <select bind:value={workspaceType} on:change={onWorkspaceTypeChange}><option value="git">Git</option><option value="file">文件</option></select>
       <input bind:value={workspaceName} placeholder="配置名称">
       <input bind:value={workspaceComment} placeholder="备注">
       <button on:click={saveWorkspace}>{workspaceDraft ? '更新' : '添加'}</button>
@@ -863,10 +863,6 @@
         {:else}
           <label class="form-item"><span>完整配置 JSON</span><textarea rows="8" bind:value={workspaceConfigJson} placeholder={gitConfigJsonPlaceholder}></textarea></label>
         {/if}
-      </div>
-    {:else if workspaceType === 'empty'}
-      <div class="workspace-config-panel">
-        <div class="empty">空工作文件不需要额外配置。</div>
       </div>
     {/if}
     {#if workspaceType === 'file'}
