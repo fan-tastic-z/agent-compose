@@ -223,10 +223,10 @@ docker compose -f docker-compose.deploy.yml up -d
 ```
 
 Override `AGENT_COMPOSE_IMAGE`, `AGENT_COMPOSE_FRONTEND_IMAGE`, or
-`DEFAULT_IMAGE` to pin a release tag such as `v2606.1.0` or use locally built
-images. The default `latest` image tag is published by the image workflow for
-release tags; main branch builds publish the `main` tag instead. The deployment
-compose serves the frontend on port `80` by default; set
+`DEFAULT_IMAGE` to pin release tags or use locally built images. The frontend is
+released independently by `agent-compose-ui`; installer manifests declare
+`AGENT_COMPOSE_FRONTEND_VERSION`, which defaults to `latest` unless explicitly
+pinned. The deployment compose serves the frontend on port `80` by default; set
 `AGENT_COMPOSE_HTTP_PORT` to use another host port. The default
 `docker-compose.yml` remains oriented toward local development builds. Set
 `AUTH_USERNAME` and `AUTH_PASSWORD` before exposing the deployment to a network.

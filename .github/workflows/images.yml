@@ -206,6 +206,7 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          frontend_version="${AGENT_COMPOSE_FRONTEND_VERSION:-latest}"
           out="${PWD}/upload"
           mkdir -p "${out}"
 
@@ -223,7 +224,8 @@ jobs:
           chmod +x "${payload}/install.sh"
           {
             echo "AGENT_COMPOSE_IMAGE=${IMAGE_PREFIX}/agent-compose:${VERSION}"
-            echo "AGENT_COMPOSE_FRONTEND_IMAGE=${IMAGE_PREFIX}/agent-compose-frontend:latest"
+            echo "AGENT_COMPOSE_FRONTEND_VERSION=${frontend_version}"
+            echo "AGENT_COMPOSE_FRONTEND_IMAGE=${IMAGE_PREFIX}/agent-compose-frontend:${frontend_version}"
             echo "DEFAULT_IMAGE=${IMAGE_PREFIX}/agent-compose-guest:${VERSION}"
           } > "${payload}/images/manifest.env"
 
