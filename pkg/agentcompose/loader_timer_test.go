@@ -979,7 +979,7 @@ func TestLoaderRunHostCommandDeletesLLMFacadeToken(t *testing.T) {
 	manager, runtime, _, loader := newTestLoaderCommandManager(t, ctx)
 	manager.config.RuntimeBaseURL = "http://agent-compose.test"
 	if _, err := manager.configDB.ReplaceGlobalEnv(ctx, []SessionEnvVar{
-		{Name: "LLM_API_ENDPOINT", Value: "https://openai-compatible.example.invalid/openai"},
+		{Name: "LLM_API_ENDPOINT", Value: "https://openai-compatible.example.invalid/api"},
 		{Name: "LLM_API_KEY", Value: "provider-key", Secret: true},
 		{Name: "LLM_MODEL", Value: "svip/gpt-5.5"},
 	}); err != nil {
@@ -1020,7 +1020,7 @@ func TestLoaderRunHostCommandSkipsOpenCodeFacadeWithoutModel(t *testing.T) {
 	manager, runtime, _, loader := newTestLoaderCommandManager(t, ctx)
 	manager.config.RuntimeBaseURL = "http://agent-compose.test"
 	if _, err := manager.configDB.ReplaceGlobalEnv(ctx, []SessionEnvVar{
-		{Name: "LLM_API_ENDPOINT", Value: "https://openai-compatible.example.invalid/openai"},
+		{Name: "LLM_API_ENDPOINT", Value: "https://openai-compatible.example.invalid/api"},
 		{Name: "LLM_API_KEY", Value: "provider-key", Secret: true},
 	}); err != nil {
 		t.Fatalf("ReplaceGlobalEnv returned error: %v", err)

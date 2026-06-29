@@ -1048,7 +1048,43 @@ func llmEndpointForProvider(provider LLMProvider, wireAPI string) string {
 		parsed.Path = pathpkg.Join(parsed.Path, "messages")
 		return parsed.String()
 	}
-	return llmEndpointForWireAPI(provider.BaseURL, wireAPI)
+	baseURL := normalizeLLMAPIBaseURL(provider.BaseURL, wireAPI)
+	if !llmProviderScopeIsConfigured(provider.Scope) {
+		return normalizeLLMAPIEndpointForProtocol(baseURL, wireAPI)
+	}
+	return appendLLMAPIEndpointToBaseURL(baseURL, wireAPI)
+}
+
+func appendLLMAPIEndpointToBaseURL(baseURL, wireAPI string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		switch normalizeLLMWireAPI(wireAPI) {
+		case llmAPIProtocolChatCompletions:
+			return baseURL + "/v1/chat/completions"
+		default:
+			return baseURL + "/v1/responses"
+		}
+	}
+	cleanPath := strings.TrimRight(parsed.Path, "/")
+	switch normalizeLLMWireAPI(wireAPI) {
+	case llmAPIProtocolChatCompletions:
+		if cleanPath == "/v1" || strings.HasSuffix(cleanPath, "/v1") {
+			parsed.Path = pathpkg.Join(cleanPath, "chat/completions")
+		} else {
+			parsed.Path = pathpkg.Join(cleanPath, "v1/chat/completions")
+		}
+	default:
+		if cleanPath == "/v1" || strings.HasSuffix(cleanPath, "/v1") {
+			parsed.Path = pathpkg.Join(cleanPath, "responses")
+		} else {
+			parsed.Path = pathpkg.Join(cleanPath, "v1/responses")
+		}
+	}
+	return parsed.String()
 }
 
 func normalizeAnthropicAPIBaseURL(raw string) string {
