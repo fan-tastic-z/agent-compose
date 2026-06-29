@@ -1088,8 +1088,11 @@ func appendLLMAPIEndpointToBaseURL(baseURL, wireAPI string) string {
 }
 
 func joinLLMAPIBasePath(parsed *url.URL, basePath, suffix string) {
+	if parsed == nil {
+		return
+	}
 	joined := pathpkg.Join(basePath, suffix)
-	if parsed != nil && parsed.Host != "" && !strings.HasPrefix(joined, "/") {
+	if parsed.Host != "" && !strings.HasPrefix(joined, "/") {
 		joined = "/" + joined
 	}
 	parsed.Path = joined
